@@ -4,8 +4,7 @@
 [![Platform: Fnos](https://img.shields.io/badge/Platform-Fnos%20-green.svg)]()
 [![Arch: x86_64 | arm64](https://img.shields.io/badge/Arch-x86__64%20%7C%20arm64-orange.svg)]()
 
-Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原生`fpk` 应用中心部署。采用基于 Bun 的 Monitor 服务进行进程管理，提供基于 Web 的控制面板用于配置和对话交互。
-
+Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原生`fpk` 应用中心部署。采用基于 Node.js 的 Monitor 服务进行进程管理，提供基于 Web 的控制面板用于配置和对话交互。
 
 ## 更新提醒
 * 我们有另一个全新的版本，支持一键配置微信Claw以及各种bot，请关注：https://github.com/veenyi/fnos-hermes-agent
@@ -54,7 +53,7 @@ Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原�
 
 /var/apps/hermes-agent/            # 应用运行目录
 ├── target/                        # 程序本体（监控脚本、静态资源）
-│   ├── server/monitor.js          # Monitor HTTP 服务（Bun）
+│   ├── server/monitor.js          # Monitor HTTP 服务（Node.js）
 │   └── ui/                        # 前端静态文件
 ├── hermes-agent.sock              # Unix socket（通信端点）
 └── var/                           # 运行时数据
@@ -90,7 +89,7 @@ fnOS 桌面图标 → 应用启动脚本 → Monitor (Bun, /var/apps/hermes-agen
 应用生命周期由 fnOS 统一管理。控制台可见状态包括：运行中、已停止、启动中。支持在控制面板「状态」页查看进程状态，但不提供手动启停按钮——所有操作均由后台进程管理接口统一调度，避免端口冲突和资源泄漏。
 
 ### 端口说明
-
+- 启动时会探测端口，如果默认端口**8642**或**9119**被占用，则改为**28642**和**29119** 
 - **8642** — Hermes Gateway 通信端口（内部使用，不对外暴露）
 - **9119** — Dashboard 仪表板端口（本地回环访问）
 
@@ -98,7 +97,7 @@ fnOS 桌面图标 → 应用启动脚本 → Monitor (Bun, /var/apps/hermes-agen
 
 ## 架构设计
 
-控制面板通过基于 HTTP 的 Bun 服务器（Monitor）通信，该服务器监听 Unix socket（`/var/apps/hermes-agent/hermes-agent.sock`）。消息被代理至端口 8642 上的 Hermes Gateway 进程。Python 虚拟环境使用 `uv` 作为包管理器，依赖项在安装时从 PyPI 镜像源拉取（阿里云镜像优先，GitHub 备用）。
+控制面板通过基于 HTTP 的 Node.js 服务器（Monitor）通信，该服务器监听 Unix socket（`/var/apps/hermes-agent/hermes-agent.sock`）。消息被代理至端口 8642 上的 Hermes Gateway 进程。Python 虚拟环境使用 `uv` 作为包管理器，依赖项在安装时从 PyPI 镜像源拉取（阿里云镜像优先，GitHub 备用）。
 
 监控令牌（Token）位于 `/vol1/@appdata/hermes-agent/monitor.token`，每次应用启动时生成随机字符串，前后端通过此 Token 鉴权。写操作（配置修改、进程重启）必须携带有效 Token，只读查询（状态、日志）免鉴权。
 
