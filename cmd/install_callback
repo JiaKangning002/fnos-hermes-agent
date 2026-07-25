@@ -109,15 +109,44 @@ ensure_uv() {
 }
 
 # ---------------------------------------------------------------------------
-# 在线下载 Node.js v22 运行时（对话增强功能，失败不影响主安装）
+# 准备 Node.js 运行时到 data/node（对话增强功能，失败不影响主安装）
+#
+# 设计：data/node 为唯一「权威运行时」——完整发行版（含 npm/lib），随后由权限修复段
+# chown 给 app 用户，获得最大权限、可自管升级。hermes 一律优先调用 data 下资源。
+# 获取来源按优先级：
+#   A. 复用飞牛应用中心已装的 Node.js（隔离于 /var/apps/nodejs_v*/target 或
+#      /vol1/@appcenter/nodejs_v*，含完整 node+npm，无需联网）→ 复制完整发行版
+#   B. 在线下载完整发行版（来源 A 不可用时兜底）
 # ---------------------------------------------------------------------------
-ensure_node() {
-    local NODE_DIR="${DATA_DIR}/node/bin"
-    local NODE_BIN="${NODE_DIR}/node"
+# 打印 node/npm 版本摘要（npm 版本用 node 直接执行 npm-cli.js 获取，
+# 避开 shell PATH / shebang 依赖，确保日志里的 npm 版本真实可信）
+_log_node_summary() {
+    local src_label="$1" root="$2"
+    local nbin="${root}/bin/node"
+    local npm_cli="${root}/lib/node_modules/npm/bin/npm-cli.js"
+    local nver npmver
+    nver="$("${nbin}" --version 2>/dev/null || echo 'unknown')"
+    if [ -f "${npm_cli}" ]; then
+        npmver="$("${nbin}" "${npm_cli}" --version 2>/dev/null || echo 'unknown')"
+    else
+        npmver="missing"
+    fi
+    log_msg "────────────────────────────────────────────"
+    log_msg "[node] 就绪 ✓  来源：${src_label}"
+    log_msg "[node]   路径: ${nbin}"
+    log_msg "[node]   版本: node ${nver} | npm ${npmver}"
+    log_msg "────────────────────────────────────────────"
+}
 
-    # 幂等：已存在且可执行则跳过
+ensure_node() {
+    local NODE_ROOT="${DATA_DIR}/node"
+    local NODE_BIN="${NODE_ROOT}/bin/node"
+    local NODE_SRC=""
+
+    # 幂等：已存在可执行 node 则跳过（旧版仅二进制的安装同样可跑，无需强制重建）
     if [ -x "${NODE_BIN}" ]; then
-        log_msg "node found: ${NODE_BIN} ($("${NODE_BIN}" --version 2>/dev/null || echo 'unknown'))"
+        log_msg "[node] 已存在，跳过获取（幂等）；如需重测来源请先删除 ${NODE_ROOT}"
+        _log_node_summary "复用已有 data/node" "${NODE_ROOT}"
         return 0
     fi
 
@@ -127,74 +156,102 @@ ensure_node() {
         x86_64)        ARCH="x64" ;;
         aarch64|arm64) ARCH="arm64" ;;
         *)
-            log_msg "WARNING: unsupported arch $(uname -m) for node download, skipping"
+            log_msg "WARNING: unsupported arch $(uname -m) for node, skipping"
             return 0
             ;;
     esac
 
-    # 使用已知稳定的 Node v22 LTS 版本号常量（避免在线解析目录列表）
-    # v22.16.0 — 2025-05 发布的长期支持版，经生产验证
-    # 选 .tar.gz 格式确保设备无 xz 工具也能解包
-    local NODE_VER="v22.16.0"
-    local TARBALL="node-${NODE_VER}-linux-${ARCH}.tar.gz"
-    local MIRROR_URL="https://npmmirror.com/mirrors/node/${NODE_VER}/${TARBALL}"
-    local OFFICIAL_URL="https://nodejs.org/dist/${NODE_VER}/${TARBALL}"
+    # ── 来源 A：复用飞牛应用中心已装的 Node.js（完整发行版，无需联网） ──
+    # 应用中心隔离安装，路径含版本号且不在系统 PATH。glob 匹配后按版本号取最高者，
+    # 复制完整发行版到 data/node（cp -a 保留权限/符号链接）。
+    log_msg "[node] 步骤1/2 — 探测飞牛 Node.js 应用（来源A，优先，无需联网）..."
+    local SRC_NODE_DIR=""
+    local cand
+    for cand in $(ls -d /var/apps/nodejs_v*/target /vol1/@appcenter/nodejs_v*/ 2>/dev/null | sort -V); do
+        cand="${cand%/}"
+        [ -x "${cand}/bin/node" ] && SRC_NODE_DIR="${cand}"   # 覆盖 → 最终保留最高版本
+    done
 
-    log_msg ">>> 正在下载 Node.js ${NODE_VER} (${ARCH}) ..."
-
-    # ── 非致命下载：子 shell 内执行，exit 1 仅退出子 shell；|| true 规避 ERR trap ──
-    (
-        set +e
-        TMP_DIR="$(mktemp -d)"
-        DL_PATH="${TMP_DIR}/${TARBALL}"
-        DL_OK=false
-
-        # 优先国内镜像（npmmirror）
-        log_msg "mirror: ${MIRROR_URL}"
-        if curl -L --retry 3 --retry-delay 3 --connect-timeout 15 --progress-bar \
-             -o "${DL_PATH}" "${MIRROR_URL}" 2>&1 && [ -s "${DL_PATH}" ]; then
-            DL_OK=true
-        else
-            # 兜底官方源
-            log_msg "mirror failed, trying official: ${OFFICIAL_URL}"
-            if curl -L --retry 3 --retry-delay 5 --connect-timeout 15 --progress-bar \
-                 -o "${DL_PATH}" "${OFFICIAL_URL}" 2>&1 && [ -s "${DL_PATH}" ]; then
-                DL_OK=true
+    if [ -n "${SRC_NODE_DIR}" ]; then
+        local SRC_VER
+        SRC_VER="$("${SRC_NODE_DIR}/bin/node" --version 2>/dev/null || echo 'unknown')"
+        log_msg "[node] 来源A命中：${SRC_NODE_DIR} (node ${SRC_VER})，取系统最高版本"
+        log_msg "[node]   复制完整发行版 → ${NODE_ROOT}（含 npm/lib，cp -a 保权限）..."
+        (
+            set +e
+            mkdir -p "${NODE_ROOT}"
+            if cp -a "${SRC_NODE_DIR}/." "${NODE_ROOT}/" 2>>"${LOG_FILE}" && [ -x "${NODE_BIN}" ]; then
+                log_msg "[node]   复制完成"
+            else
+                log_msg "[node]   WARNING: 来源A 复制失败，回退到在线下载（来源B）"
+                rm -rf "${NODE_ROOT}" 2>/dev/null
             fi
-        fi
-
-        if [ "${DL_OK}" != "true" ]; then
-            log_msg "WARNING: node download failed, skipping"
-            rm -rf "${TMP_DIR}"
-            exit 1
-        fi
-
-        # 解包 .tar.gz
-        if ! tar xzf "${DL_PATH}" -C "${TMP_DIR}" 2>>"${LOG_FILE}"; then
-            log_msg "WARNING: node tarball extraction failed, skipping"
-            rm -rf "${TMP_DIR}"
-            exit 1
-        fi
-
-        # 从解包目录复制 node 二进制
-        EXTRACTED_DIR="${TMP_DIR}/node-${NODE_VER}-linux-${ARCH}"
-        if [ ! -f "${EXTRACTED_DIR}/bin/node" ]; then
-            log_msg "WARNING: node binary not found in extracted dir, skipping"
-            rm -rf "${TMP_DIR}"
-            exit 1
-        fi
-
-        mkdir -p "${NODE_DIR}"
-        cp "${EXTRACTED_DIR}/bin/node" "${NODE_BIN}"
-        chmod +x "${NODE_BIN}"
-        rm -rf "${TMP_DIR}"
-    ) || true
-
-    # 验证最终结果
-    if [ -x "${NODE_BIN}" ]; then
-        log_msg "node installed: ${NODE_BIN} ($("${NODE_BIN}" --version 2>/dev/null || echo '${NODE_VER}'))"
+        ) || true
+        [ -x "${NODE_BIN}" ] && NODE_SRC="来源A·复用飞牛 nodejs 应用 (${SRC_NODE_DIR})"
     else
-        log_msg "WARNING: node 下载/安装未成功，对话功能可能不可用（不影响主功能）"
+        log_msg "[node] 来源A未命中：未发现 /var/apps/nodejs_v*/target 或 /vol1/@appcenter/nodejs_v*"
+    fi
+
+    # ── 来源 B：在线下载完整发行版（来源 A 不可用时兜底，非致命） ──
+    if [ ! -x "${NODE_BIN}" ]; then
+        # v22.16.0 — 2025-05 LTS，经生产验证；.tar.gz 确保无 xz 工具也能解包
+        local NODE_VER="v22.16.0"
+        local TARBALL="node-${NODE_VER}-linux-${ARCH}.tar.gz"
+        local MIRROR_URL="https://npmmirror.com/mirrors/node/${NODE_VER}/${TARBALL}"
+        local OFFICIAL_URL="https://nodejs.org/dist/${NODE_VER}/${TARBALL}"
+
+        log_msg "[node] 步骤2/2 — 来源A不可用，回退在线下载 Node.js ${NODE_VER} (${ARCH})..."
+        (
+            set +e
+            TMP_DIR="$(mktemp -d)"
+            DL_PATH="${TMP_DIR}/${TARBALL}"
+            DL_OK=false
+
+            log_msg "mirror: ${MIRROR_URL}"
+            if curl -L --retry 3 --retry-delay 3 --connect-timeout 15 --progress-bar \
+                 -o "${DL_PATH}" "${MIRROR_URL}" 2>&1 && [ -s "${DL_PATH}" ]; then
+                DL_OK=true
+            else
+                log_msg "mirror failed, trying official: ${OFFICIAL_URL}"
+                if curl -L --retry 3 --retry-delay 5 --connect-timeout 15 --progress-bar \
+                     -o "${DL_PATH}" "${OFFICIAL_URL}" 2>&1 && [ -s "${DL_PATH}" ]; then
+                    DL_OK=true
+                fi
+            fi
+
+            if [ "${DL_OK}" != "true" ]; then
+                log_msg "WARNING: node download failed, skipping"
+                rm -rf "${TMP_DIR}"
+                exit 1
+            fi
+
+            if ! tar xzf "${DL_PATH}" -C "${TMP_DIR}" 2>>"${LOG_FILE}"; then
+                log_msg "WARNING: node tarball extraction failed, skipping"
+                rm -rf "${TMP_DIR}"
+                exit 1
+            fi
+
+            EXTRACTED_DIR="${TMP_DIR}/node-${NODE_VER}-linux-${ARCH}"
+            if [ ! -x "${EXTRACTED_DIR}/bin/node" ]; then
+                log_msg "WARNING: node binary not found in extracted dir, skipping"
+                rm -rf "${TMP_DIR}"
+                exit 1
+            fi
+
+            # 复制完整发行版（含 npm/lib），而非仅二进制
+            mkdir -p "${NODE_ROOT}"
+            cp -a "${EXTRACTED_DIR}/." "${NODE_ROOT}/"
+            rm -rf "${TMP_DIR}"
+            log_msg "[node]   下载安装完成"
+        ) || true
+        [ -x "${NODE_BIN}" ] && NODE_SRC="来源B·在线下载 ${NODE_VER}"
+    fi
+
+    # 验证最终结果（npm 版本用 node 直接执行 npm-cli.js 获取，PATH 无关，真实可信）
+    if [ -x "${NODE_BIN}" ]; then
+        _log_node_summary "${NODE_SRC:-未知来源}" "${NODE_ROOT}"
+    else
+        log_msg "[node] WARNING: node 未就绪，对话功能可能不可用（不影响主功能）"
     fi
 }
 
@@ -325,7 +382,9 @@ SKIP_INSTALL=false
 INSTALLED_VER=""
 
 # 用 uv pip show 检测已安装版本
-if INSTALLED_VER=$("$UV" pip show --python "${VENV_DIR}/bin/python3" hermes-agent 2>"${LOG_FILE}" | grep -i '^version' | awk '{print $2}'); then
+# stderr 丢弃：uv 每次都会打印 "Using Python ..." 噪声（导致日志重复行）；
+# 且原先的 2>"${LOG_FILE}"（单 >）会截断此前已有日志。版本信息我们已用 log_msg 自行记录。
+if INSTALLED_VER=$("$UV" pip show --python "${VENV_DIR}/bin/python3" hermes-agent 2>/dev/null | grep -i '^version' | awk '{print $2}'); then
     log_msg "Detected hermes-agent ${INSTALLED_VER}, target ${HERMES_VERSION}"
     if [ "${INSTALLED_VER}" = "${HERMES_VERSION}" ]; then
         SKIP_INSTALL=true
@@ -369,7 +428,8 @@ if [ "${SKIP_INSTALL}" = "false" ]; then
     log_msg "hermes binary verified"
 fi
 
-ACTUAL_VER=$("$UV" pip show --python "${VENV_DIR}/bin/python3" hermes-agent 2>>"${LOG_FILE}" | grep -i '^version' | awk '{print $2}' || echo "unknown")
+# 同上：stderr 丢弃，避免第二条 "Using Python ..." 重复行
+ACTUAL_VER=$("$UV" pip show --python "${VENV_DIR}/bin/python3" hermes-agent 2>/dev/null | grep -i '^version' | awk '{print $2}' || echo "unknown")
 log_msg "hermes-agent installed: ${ACTUAL_VER}"
 
 # 把 uv 软链接进 venv/bin，让 hermes 运行时（PATH 仅含 venv/bin）能找到 uv

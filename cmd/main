@@ -1,28 +1,132 @@
 #!/bin/bash
 #
 # Hermes Agent — 生命周期管理
-# start:  启动 Bun monitor（后台运行，写 PID 文件）
+# start:  启动 Node.js monitor（后台运行，写 PID 文件）
 # stop:   发送 SIGTERM，等待优雅关闭，超时 SIGKILL
 # status: 查询进程状态
 #
 
-TRIM_APPDEST="${TRIM_APPDEST:-/var/apps/hermes-agent}"
-TRIM_PKGHOME="${TRIM_PKGHOME:-/var/apps/hermes-agent/home}"
-TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/hermes-agent/var}"
+# 从环境变量或系统默认值获取路径（支持任意 volume：vol1, vol2, volx, etc.）
+TRIM_APPDEST="${TRIM_APPDEST:-/vol1/@appcenter/hermes-agent}"
+TRIM_PKGHOME="${TRIM_PKGHOME:-/vol1/@apphome/hermes-agent}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/vol1/@appdata/hermes-agent}"
+
+# 提取实际使用的 volume 前缀（自动探测 vol1/vol2/volx 等）
+detect_volume_prefix() {
+    local base_dir="$1"
+    # 从路径中提取 /volX/ 部分
+    echo "$base_dir" | sed -E 's#^(/vol[0-9]+|/vol[a-z]+).*/#\1#'
+}
+
+# 动态计算 DATA_DIR，使用实际存在的 node 路径
+resolve_data_dir() {
+    # 优先级 1: 已设置的 TRIM_PKGHOME
+    if [ -n "${TRIM_PKGHOME}" ] && [ -d "${TRIM_PKGHOME}/data" ]; then
+        echo "${TRIM_PKGHOME}/data"
+        return
+    fi
+    
+    # 优先级 2: 从 TRIM_APPDEST 推导
+    if [ -n "${TRIM_APPDEST}" ] && [ -d "$(dirname "${TRIM_APPDEST}")/hermes-agent/data" ]; then
+        echo "$(dirname "${TRIM_APPDEST}")/hermes-agent/data"
+        return
+    fi
+    
+    # 优先级 3: 遍历可能的 volume 查找（一般最多 8 个卷）
+    for vol_num in 1 2 3 4 5 6 7 8; do
+        if [ -d "/vol${vol_num}/@appcenter/hermes-agent/server" ]; then
+            echo "/vol${vol_num}/@apphome/hermes-agent/data"
+            return
+        fi
+    done
+    
+    # 找不到返回空
+    echo ""
+}
+
+# 动态导出 PATH（找到 node 二进制所在目录）
+export_node_path() {
+    local data_dir="$1"
+    if [ -d "${data_dir}/node/bin" ]; then
+        export PATH="${data_dir}/node/bin:/usr/local/bin:$PATH"
+        log_msg "[环境] NODE_PATH=${data_dir}/node/bin"
+    else
+        log_msg "[警告] 未找到 ${data_dir}/node/bin，尝试全局 node"
+    fi
+}
 
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
-export PATH=/var/apps/bunjs/target/bin:$PATH
-DATA_DIR="${TRIM_PKGHOME}/data"
+DATA_DIR=$(resolve_data_dir)
+
+if [ -z "${DATA_DIR}" ]; then
+    log_msg "[错误] 无法定位数据目录，请检查应用安装路径"
+    exit 1
+fi
+
+log_msg "[环境] TRIM_APPDEST=${TRIM_APPDEST}"
+log_msg "[环境] TRIM_PKGHOME=${TRIM_PKGHOME}"
+log_msg "[环境] DATA_DIR=${DATA_DIR}"
+export PATH="${DATA_DIR}/node/bin:/usr/local/bin:$PATH"
 VAR_DIR="${TRIM_PKGVAR}"
 MONITOR_SCRIPT="${TRIM_APPDEST}/server/monitor.js"
 SOCKET_PATH="${TRIM_APPDEST}/hermes-agent.sock"
 
 log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}; }
 
+# ─── 端口检测函数 ──────────────────────────────────────────────────────
+check_and_set_ports() {
+    local GW_PORT="${GATEWAY_PORT:-8642}"
+    local DB_PORT="${DASHBOARD_PORT:-9119}"
+    local ALTERNATE_GW="28642"
+    local ALTERNATE_DB="29119"
+
+    # 检查默认端口是否被占用（通过 /proc/net/tcp）
+    is_port_in_use() {
+        local port="$1"
+        local hex_port
+        hex_port=$(printf "%04X" "$port")
+        grep -q ":[[:space:]]*${hex_port}:" /proc/net/tcp /proc/net/tcp6 2>/dev/null
+    }
+
+    if [ -z "${GATEWAY_PORT}" ] && [ -z "${DASHBOARD_PORT}" ]; then
+        # 两个都未设置，检查默认组合
+        if is_port_in_use 8642 || is_port_in_use 9119; then
+            GATEWAY_PORT=$ALTERNATE_GW
+            DASHBOARD_PORT=$ALTERNATE_DB
+            log_msg "[端口检测] 默认端口 8642/9119 被占用，切换至 ${ALTERNATE_GW}/${ALTERNATE_DB}"
+        else
+            GATEWAY_PORT=8642
+            DASHBOARD_PORT=9119
+        fi
+    elif [ -z "${GATEWAY_PORT}" ]; then
+        # 只检查 Gateway 端口
+        if is_port_in_use 8642; then
+            GATEWAY_PORT=$ALTERNATE_GW
+            log_msg "[端口检测] Gateway 端口 8642 被占用，切换至 ${ALTERNATE_GW}"
+        else
+            GATEWAY_PORT=8642
+        fi
+    elif [ -z "${DASHBOARD_PORT}" ]; then
+        # 只检查 Dashboard 端口
+        if is_port_in_use 9119; then
+            DASHBOARD_PORT=$ALTERNATE_DB
+            log_msg "[端口检测] Dashboard 端口 9119 被占用，切换至 ${ALTERNATE_DB}"
+        else
+            DASHBOARD_PORT=9119
+        fi
+    fi
+
+    export GATEWAY_PORT DASHBOARD_PORT
+    log_msg "[端口检测] GATEWAY_PORT=${GATEWAY_PORT}, DASHBOARD_PORT=${DASHBOARD_PORT}"
+}
+
 start_process() {
     if status; then return 0; fi
-    if ! command -v bun >/dev/null 2>&1; then log_msg "bun not found"; return 1; fi
+    if ! command -v node >/dev/null 2>&1; then log_msg "node not found"; return 1; fi
+
+    # 检测并设置端口（在 main 中完成端口冲突处理）
+    check_and_set_ports
 
     # 确保 socket 目录存在且可写
     local SOCK_DIR="$(dirname "${SOCKET_PATH}")"
@@ -36,7 +140,7 @@ start_process() {
     log_msg "TRIM_APPDEST=${TRIM_APPDEST}"
     rm -f "${SOCKET_PATH}"
 
-    HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" APP_DIR="${TRIM_APPDEST}" DATA_DIR="${DATA_DIR}" VAR_DIR="${VAR_DIR}" MONITOR_SOCKET_PATH="${SOCKET_PATH}" BASE_PATH="/app/hermes-agent" PATH="${DATA_DIR}/venv/bin:/var/apps/bunjs/target/bin:/usr/local/bin:/usr/bin:/bin" bun "${MONITOR_SCRIPT}" >> ${LOG_FILE} 2>&1 &
+    HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" APP_DIR="${TRIM_APPDEST}" DATA_DIR="${DATA_DIR}" VAR_DIR="${VAR_DIR}" MONITOR_SOCKET_PATH="${SOCKET_PATH}" BASE_PATH="/app/hermes-agent" PATH="${DATA_DIR}/venv/bin:${DATA_DIR}/node/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin" GATEWAY_PORT="${GATEWAY_PORT}" DASHBOARD_PORT="${DASHBOARD_PORT}" node "${MONITOR_SCRIPT}" >> ${LOG_FILE} 2>&1 &
     printf "%s" "$!" > ${PID_FILE}
 
     # 等待 socket 创建（最多 5 秒）
@@ -70,6 +174,13 @@ stop_process() {
         fi
         rm -f "${PID_FILE}"
     fi
+    # 兜底：监控器卡死或 PID 文件丢失时，按路径模式清理残留子进程
+    # 先杀 main 进程本身
+    pkill -SIGKILL -f "hermes-agent.*(cmd/main|monitor\.js)" 2>/dev/null || true
+    # 再杀 gateway|dashboard
+    pkill -SIGKILL -f "hermes-agent.*(gateway|dashboard)" 2>/dev/null || true
+    # 最后杀该目录下所有 python/node 子进程
+    pkill -SIGKILL -P ${pid} 2>/dev/null || true
     rm -f "${SOCKET_PATH}"
     return 0
 }

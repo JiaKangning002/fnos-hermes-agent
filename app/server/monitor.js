@@ -1,8 +1,10 @@
-// Hermes Agent 监控服务 — 基于 Bun 的 HTTP 服务（Unix Socket / TCP）
-import { spawn, spawnSync } from "bun";
+// Hermes Agent 监控服务 — Node.js HTTP 服务（Unix Socket）
+import { serve, file, spawn, WebSocketClient } from "./node-adapter.js";
 import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync, statSync, symlinkSync, watch, chmodSync, readdirSync } from "fs";
 import { randomBytes } from "crypto";
 import { networkInterfaces } from "os";
+import net from "net";
+import { spawnSync } from "child_process";
 import { PROVIDER_PRESETS, PROVIDER_MODELS, PROVIDER_API_KEYS, PROVIDER_CLASSES, PROVIDER_HERMES_IDS } from "./provider-config.js";
 
 // 自定义 provider 环境变量名：剥离 id 中 "custom-" 前缀后规范化大写
@@ -16,9 +18,37 @@ function legacyCustomEnvKey(id) {
   return `CUSTOM_PROVIDER_${bare.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}_API_KEY`;
 }
 
-const APP_DIR        = process.env.APP_DIR       || "/var/apps/hermes-agent";
-const DATA_DIR       = process.env.DATA_DIR      || `${APP_DIR}/home/data`;
-const VAR_DIR        = process.env.VAR_DIR       || `${APP_DIR}/var`;
+// 动态检测当前运行路径 - 完全不使用硬编码的盘符或路径
+const ENV_APP_DIR   = process.env.APP_DIR;
+const ENV_DATA_DIR  = process.env.DATA_DIR;
+const ENV_VAR_DIR   = process.env.VAR_DIR;
+
+let APP_DIR;
+
+if (ENV_APP_DIR) {
+  // 优先级最高：环境变量指定的路径
+  APP_DIR = ENV_APP_DIR;
+} else {
+  // 从当前 monitor.js 所在的文件路径自动推导 APP_DIR
+  // __dirname 是 monitor.js 所在目录，即 <APP_DIR>/server
+  try {
+    const os = require('os');
+    const pathModule = os.platform() === 'win32' ? require('path') : require('path').posix;
+    
+    // __dirname 通常是 "/volX/@appcenter/hermes-agent/server" 或 "/var/apps/hermes-agent/target/server"
+    const currentDir = __dirname; // e.g., "/vol1/@appcenter/hermes-agent/server"
+    const parentDir = pathModule.dirname(currentDir); // e.g., "/vol1/@appcenter/hermes-agent"
+    
+    APP_DIR = parentDir;
+  } catch (e) {
+    console.error(`[路径探测] 无法自动推导 APP_DIR: ${e.message}`);
+    // 最后退路：从环境变量或系统默认路径尝试
+    APP_DIR = process.env.APP_DIR || "/vol1/@appcenter/hermes-agent";
+  }
+}
+
+const DATA_DIR = ENV_DATA_DIR || `${APP_DIR}/data`;
+const VAR_DIR = ENV_VAR_DIR || `${APP_DIR}/var`;
 const LOG_FILE       = `${VAR_DIR}/hermes.log`;
 const PID_GATEWAY    = `${VAR_DIR}/gateway.pid`;
 const PID_DASHBOARD  = `${VAR_DIR}/dashboard.pid`;
@@ -56,14 +86,52 @@ function formatUptime(ms) {
   return parts.join(" ");
 }
 
-const GATEWAY_PORT   = 8642;
+// ─── 端口配置（优先使用环境变量，如有冲突则切换到备选端口）─────────────
+const DEFAULT_GATEWAY_PORT   = 8642;
+const DEFAULT_DASHBOARD_PORT = 9119;
+const ALTERNATE_GATEWAY_PORT = 28642;
+const ALTERNATE_DASHBOARD_PORT = 29119;
+
+let GATEWAY_PORT   = Number(process.env.GATEWAY_PORT);
+let DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT);
+
+// 只有当环境变量未设置时，才在 monitor.js 中进行兜底检测
+if (!GATEWAY_PORT && !DASHBOARD_PORT) {
+  // 两个端口都未设置，尝试使用默认组合
+  const gwUsed = isPortListening(DEFAULT_GATEWAY_PORT);
+  const dbUsed = isPortListening(DEFAULT_DASHBOARD_PORT);
+  if (gwUsed || dbUsed) {
+    GATEWAY_PORT   = ALTERNATE_GATEWAY_PORT;
+    DASHBOARD_PORT = ALTERNATE_DASHBOARD_PORT;
+    console.log(`[端口检测] 默认端口 ${DEFAULT_GATEWAY_PORT}/${DEFAULT_DASHBOARD_PORT} 被占用，切换至 ${ALTERNATE_GATEWAY_PORT}/${ALTERNATE_DASHBOARD_PORT}`);
+  } else {
+    GATEWAY_PORT   = DEFAULT_GATEWAY_PORT;
+    DASHBOARD_PORT = DEFAULT_DASHBOARD_PORT;
+  }
+} else if (!GATEWAY_PORT) {
+  // 只有 Gateway 端口未设置，检查默认值是否可用（兜底情况）
+  if (isPortListening(DEFAULT_GATEWAY_PORT)) {
+    GATEWAY_PORT = ALTERNATE_GATEWAY_PORT;
+    console.log(`[端口检测] Gateway 端口 ${DEFAULT_GATEWAY_PORT} 被占用，切换至 ${ALTERNATE_GATEWAY_PORT}`);
+  } else {
+    GATEWAY_PORT = DEFAULT_GATEWAY_PORT;
+  }
+} else if (!DASHBOARD_PORT) {
+  // 只有 Dashboard 端口未设置，检查默认值是否可用（兜底情况）
+  if (isPortListening(DEFAULT_DASHBOARD_PORT)) {
+    DASHBOARD_PORT = ALTERNATE_DASHBOARD_PORT;
+    console.log(`[端口检测] Dashboard 端口 ${DEFAULT_DASHBOARD_PORT} 被占用，切换至 ${ALTERNATE_DASHBOARD_PORT}`);
+  } else {
+    DASHBOARD_PORT = DEFAULT_DASHBOARD_PORT;
+  }
+}
+
 const SOCKET_PATH    = (process.env.MONITOR_SOCKET_PATH || "").trim();
 if (!SOCKET_PATH) {
   console.error("[FATAL] MONITOR_SOCKET_PATH is required — unix socket mode only");
   process.exit(1);
 }
 const BASE_PATH      = (process.env.BASE_PATH || "").replace(/\/+$/, "");
-const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT || "9119");
 const STATIC_DIR     = `${APP_DIR}/ui`;
 const VENV_BIN       = `${DATA_DIR}/venv/bin`;
 const HERMES_BIN     = `${VENV_BIN}/hermes`;
@@ -71,9 +139,12 @@ const UV_BIN_PATH    = `${VENV_BIN}/uv`;
 
 // ─── Node.js 运行时探测（hermes TUI 需要 node；版本在安装期由 install_callback 固定） ───
 
+// data 优先：install_callback 的 ensure_node 会把最佳来源（飞牛 Node.js 应用 / 在线
+// 下载）materialize 成 data/node 完整发行版并 chown 给 app 用户（最大权限、可自管）。
+// 故 data/node 为权威运行时；app/runtime/node（若未来随包内置）仅作 data 缺失时的兜底。
 const NODE_CANDIDATES = [
-  `${APP_DIR}/runtime/node/bin/node`,            // ① 打包内置（最高优先）
-  `${DATA_DIR}/node/bin/node`,                   // ② 安装期 ensure_node 下载并固定的路径
+  `${DATA_DIR}/node/bin/node`,                   // ① data 权威运行时（最大权限，与 python venv 对齐）
+  `${APP_DIR}/runtime/node/bin/node`,            // ② 打包内置兜底（若未来随包分发）
 ];
 const resolvedNodeBin = NODE_CANDIDATES.find(p => {
   try { return existsSync(p) && (statSync(p).mode & 0o111) !== 0; } catch { return false; }
@@ -83,17 +154,19 @@ const resolvedNodeDir = resolvedNodeBin ? resolvedNodeBin.replace(/\/[^/]+$/, ""
 // ─── HERMES_TUI_DIR：TUI 运行时 shim 目录 ──────────────────────────────
 const TUI_DIR = `${DATA_DIR}/tui`;
 
-// ─── 聊天数据路径（持久化于 VAR_DIR → /vol1/@appdata/） ────────────────
+// ─── 聊天数据路径（统一在 workspace 目录下） ────────────────
 const CHAT_DIR      = `${VAR_DIR}/chat`;
 const CONFIG_FILE   = `${CHAT_DIR}/config.json`;
 const SESSIONS_DIR  = `${CHAT_DIR}/sessions`;
-const TMP_DIR       = `${VAR_DIR}/tmp`;
-const UPLOAD_DIR      = `${DATA_DIR}/uploads`;
-const UPLOAD_IMG_DIR  = `${UPLOAD_DIR}/images`;
-const UPLOAD_FILE_DIR = `${UPLOAD_DIR}/files`;
-const WORKSPACE_DIR   = `${DATA_DIR}/workspace`;
+const WORKSPACE_DIR = `${DATA_DIR}/workspace`;
+const TMP_DIR       = `${WORKSPACE_DIR}/tmp`;
+const UPLOAD_DIR    = `${WORKSPACE_DIR}/uploads`;
+const UPLOAD_IMG_DIR = `${WORKSPACE_DIR}/images`;
+const UPLOAD_FILE_DIR = `${WORKSPACE_DIR}/files`;
 const GATEWAY_API   = `http://localhost:${GATEWAY_PORT}/v1`;
 const DASHBOARD_BIND = "127.0.0.1";
+// 向上游发请求时统一使用的浏览器风格 UA，避免 Cloudflare 类网关因缺少 User-Agent 掐断连接
+const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 // ─── API Key 自动生成（12位随机字母数字）─────────────────────────────────────
 function generateApiKey() {
@@ -114,7 +187,8 @@ try {
   if (!existsSync(tuiEntry)) {
     // 动态探测 hermes_cli 的 tui_dist/entry.js（不硬编码 python 版本）
     const pyResult = spawnSync(
-      [`${VENV_BIN}/python3`, "-c", "import hermes_cli,os;print(os.path.dirname(hermes_cli.__file__))"],
+      `${VENV_BIN}/python3`,
+      ["-c", "import hermes_cli,os;print(os.path.dirname(hermes_cli.__file__))"],
       { stdout: "pipe", stderr: "pipe" }
     );
     const hermesCli = pyResult.stdout?.toString().trim();
@@ -138,9 +212,10 @@ function pidAliveSync(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 try {
-  const { spawnSync } = require("bun");
-  spawnSync(["pkill", "-SIGKILL", "-f", "hermes.*(gateway|dashboard)"]);
-} catch {}
+  spawnSync("pkill", ["-SIGKILL", "-f", "hermes-agent.*(gateway|dashboard)"]);
+} catch (e) {
+  log(`[启动清理] pkill 执行失败: ${e.message}`);
+}
 for (const pidFile of [PID_GATEWAY, PID_DASHBOARD]) {
   const oldPid = readPidSync(pidFile);
   if (oldPid && pidAliveSync(oldPid)) {
@@ -164,47 +239,132 @@ function formatHermesVersion(raw) {
   return out;
 }
 let HERMES_VERSION = "unknown";
+// 尝试探测 hermes 实际位置
+let HERMES_BIN_PATH = `${VENV_BIN}/hermes`;
+if (!existsSync(HERMES_BIN_PATH)) {
+  try {
+    const files = readdirSync(VENV_BIN);
+    const hermesFile = files.find(f => f.startsWith('hermes') && !f.endsWith('.pyc'));
+    if (hermesFile) {
+      HERMES_BIN_PATH = `${VENV_BIN}/${hermesFile}`;
+      log(`[版本检测] 找到替代路径：${HERMES_BIN_PATH}`);
+    }
+  } catch {}
+}
 try {
   // 优先读缓存文件（瞬间完成），让服务器尽快启动
   if (existsSync(VERSION_FILE)) {
     const cached = readFileSync(VERSION_FILE, "utf8").trim();
     if (cached) HERMES_VERSION = cached;
   }
-  // 缓存没有时才执行 hermes --version（可能耗时数秒）
-  if (HERMES_VERSION === "unknown") {
-    const { spawnSync } = require("bun");
-    const verResult = spawnSync([HERMES_BIN, "--version"], { stdout: "pipe", stderr: "pipe" });
-    const verOut = ((verResult.stdout ? verResult.stdout.toString() : "").trim())
-                || ((verResult.stderr ? verResult.stderr.toString() : "").trim());
-    if (verOut) {
-      HERMES_VERSION = formatHermesVersion(verOut);
-      try { writeFileSync(VERSION_FILE, HERMES_VERSION, { mode: 0o644 }); } catch {}
+// 缓存没有时才执行 hermes --version（可能耗时数秒）
+if (HERMES_VERSION === "unknown") {
+  log(`[版本检测] 尝试从 hermes 二进制获取版本号：${HERMES_BIN_PATH}`);
+  
+  // 尝试 1: 标准方式
+  const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], { 
+    stdout: "pipe", 
+    stderr: "pipe"
+  });
+  
+  let verOut = "";
+  log(`[版本检测] exitCode=${verResult.status}, hasStdout=${!!verResult.stdout}, hasStderr=${!!verResult.stderr}`);
+  
+  if (verResult.stdout) {
+    try {
+      verOut = verResult.stdout.toString("utf8").trim();
+      log(`[版本检测] stdout: ${verOut ? `"${verOut}"` : "(empty)"}`);
+    } catch (e) {
+      log(`[版本检测] stdout 解码失败：${e.message}`);
     }
   }
+  
+  if (!verOut && verResult.stderr) {
+    try {
+      verOut = verResult.stderr.toString("utf8").trim();
+      log(`[版本检测] stderr: ${verOut ? `"${verOut}"` : "(empty)"}`);
+    } catch (e) {
+      log(`[版本检测] stderr 解码失败：${e.message}`);
+    }
+  }
+  
+  // 尝试 2: 如果 standard way 不行，试试直接运行不加参数
+  if (!verOut) {
+    log(`[版本检测] 标准方式失败，尝试备选方案...`);
+    
+    // 检查是否是 shebang 问题
+    let firstLine = "";
+    try {
+      if (existsSync(HERMES_BIN_PATH)) {
+        const fs = require('fs');
+        const fileStream = fs.createReadStream(HERMES_BIN_PATH, { autoClose: true });
+        const reader = require('stream').Readable.from(fileStream);
+        const chunks = [];
+        for await (const chunk of reader) chunks.push(chunk);
+        if (chunks.length > 0) {
+          firstLine = Buffer.concat(chunks).toString('utf8').split('\n')[0];
+          log(`[版本检测] 文件第一行：${firstLine.substring(0, 50)}...`);
+        }
+      }
+    } catch (e) {
+      log(`[版本检测] 读取文件第一行失败：${e.message}`);
+    }
+    
+    // 如果是 Python 脚本，直接用 python3 运行
+    if (firstLine.includes('python') || firstLine.includes('#!')) {
+      log(`[版本检测] 检测到 shebang，使用 Python 运行`);
+      const pyResult = spawnSync("python3", [HERMES_BIN_PATH, "--version"], {
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+      
+      if (pyResult.stdout) {
+        verOut = pyResult.stdout.toString("utf8").trim();
+        log(`[版本检测] Python3 方式输出：${verOut ? `"${verOut}"` : "(empty)"}`);
+      }
+    }
+  }
+  
+  if (verOut) {
+    HERMES_VERSION = formatHermesVersion(verOut);
+    try { writeFileSync(VERSION_FILE, HERMES_VERSION, { mode: 0o644 }); } catch {}
+    log(`[版本检测] 成功解析版本：${HERMES_VERSION}`);
+  } else {
+    log(`[版本检测] hermes --version 所有方式都失败`);
+  }
+}
   // 后台异步刷新版本（解决升级后缓存文件仍是旧版本号的问题）
   setTimeout(() => {
     try {
-      const { spawnSync } = require("bun");
-      const r = spawnSync([HERMES_BIN, "--version"], { stdout: "pipe", stderr: "pipe" });
+      const r = spawnSync(HERMES_BIN_PATH, ["--version"], { stdout: "pipe", stderr: "pipe" });
       const out = ((r.stdout ? r.stdout.toString() : "").trim())
                || ((r.stderr ? r.stderr.toString() : "").trim());
       if (out) {
         const realVer = formatHermesVersion(out);
         if (realVer !== HERMES_VERSION) {
           HERMES_VERSION = realVer;
-          try { writeFileSync(VERSION_FILE, realVer, { mode: 0o644 }); } catch {}
-          log(`版本已刷新: ${realVer}`);
+          try { writeFileSync(VERSION_FILE, realVer, { mode: 0o644 }); } catch (e2) {
+            log(`[版本检测] 后台刷新写入缓存失败: ${e2.message}`);
+          }
+          log(`版本已刷新：${realVer}`);
         }
+      } else if (r.error) {
+        log(`[版本检测] 后台刷新执行失败: ${r.error.message}`);
       }
-    } catch {}
+    } catch (e) {
+      log(`[版本检测] 后台刷新异常: ${e.message}`);
+    }
   }, 3000);
-} catch {
+} catch (e) {
+  log(`[版本检测] 版本探测流程异常: ${e.message}`);
   try {
     if (existsSync(VERSION_FILE)) {
       const cached = readFileSync(VERSION_FILE, "utf8").trim();
       if (cached) HERMES_VERSION = cached;
     }
-  } catch {}
+  } catch (e2) {
+    log(`[版本检测] 读取缓存文件也失败: ${e2.message}`);
+  }
 }
 log(`[启动检测] Hermes Agent 版本: ${HERMES_VERSION}`);
 
@@ -381,7 +541,6 @@ function sessionFile(id) {
 }
 function listSessions() {
   try {
-    const { readdirSync } = require("fs");
     const files = readdirSync(SESSIONS_DIR).filter(f => f.endsWith(".json"));
     return files.map(f => {
       try {
@@ -527,7 +686,7 @@ function createSSEParser(onDelta, onDone, onError, onToolEvent) {
 async function fetchGatewayModels(provider) {
   const t0 = Date.now();
   try {
-    const headers = {};
+    const headers = { "User-Agent": UPSTREAM_UA, "Accept": "application/json" };
     // LOCAL provider 必须用真实 MONITOR_TOKEN
     const isLocal = (provider.base_url === "LOCAL" || provider.id === "hermes");
     if (!isLocal && !provider.base_url) {
@@ -668,7 +827,7 @@ async function chatRequest(provider, message, history, reqSignal) {
     }
   }
 
-  const headers = { "Content-Type": "application/json" };
+  const headers = { "Content-Type": "application/json", "User-Agent": UPSTREAM_UA, "Accept": "application/json" };
   if (apiKey && apiKey !== "none") {
     headers["Authorization"] = `Bearer ${apiKey}`;
   }
@@ -1036,10 +1195,19 @@ const wsHandler = {
     // Dashboard WS 反代
     if (ws.data.type === "dashboard-proxy") {
       const { targetUrl } = ws.data;
+      if (!targetUrl) {
+        // 防御性兜底：正常情况下 node-adapter.js 已经不会再产出没有
+        // targetUrl 的连接了，这里只是避免万一出现该情况时直接把 null
+        // 传给 WebSocketClient 构造函数，导致 ws 库内部访问
+        // options.autoPong 时抛出 TypeError。
+        log(`[WS-PROXY] open with empty targetUrl, closing`);
+        try { ws.close(1011, "no target url"); } catch {}
+        return;
+      }
       log(`[WS-PROXY] open → ${targetUrl}`);
       try {
         // 显式传 Host header 匹配上游 loopback 校验（_is_accepted_host）
-        const upstream = new WebSocket(targetUrl, {
+        const upstream = new WebSocketClient(targetUrl, {
           headers: {
             "Host": `${DASHBOARD_BIND}:${DASHBOARD_PORT}`,
           },
@@ -1220,7 +1388,7 @@ async function stopPid(pidPath) {
 
 async function forceKillHermes() {
   try {
-    const proc = spawn(["pkill", "-SIGKILL", "-f", "hermes.*(gateway|dashboard)"]);
+    const proc = spawn(["pkill", "-SIGKILL", "-f", "hermes-agent.*(gateway|dashboard)"]);
     await proc.exited;
   } catch {}
   try { unlinkSync(PID_GATEWAY); } catch {}
@@ -1293,8 +1461,8 @@ function spawnHermes(name, pidPath, args) {
   const p = spawn({
     cmd:    [HERMES_BIN, ...args],
     env,
-    stdout: Bun.file(logPath),
-    stderr: Bun.file(logPath),
+    stdout: file(logPath),
+    stderr: file(logPath),
     stdin:  "ignore",
   });
 
@@ -1461,10 +1629,12 @@ async function proxyDashboard(req) {
   try {
     const headers = new Headers(req.headers);
     headers.delete("host");
+    const hasReqBody = req.method !== "GET" && req.method !== "HEAD";
     const upstream = await fetch(target, {
       method:  req.method,
       headers,
-      body:    req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+      body:    hasReqBody ? req.body : undefined,
+      duplex:  hasReqBody ? "half" : undefined,
       signal:  AbortSignal.timeout(10000),
     });
 
@@ -1514,6 +1684,10 @@ async function proxyDashboard(req) {
           lastGatewayRestartTs = Date.now();
           const rh = new Headers(req.headers);
           rh.delete("host");
+          // 重发不带 body，须清除原始请求的 body 相关头，否则上游等 body 超时
+          rh.delete("content-length");
+          rh.delete("content-type");
+          rh.delete("transfer-encoding");
           try {
             const up2 = await fetch(target, { method: "POST", headers: rh, signal: AbortSignal.timeout(10000) });
             bodyText = await up2.text();
@@ -1844,18 +2018,31 @@ function createLogStream(req, lastOffset) {
 }
 
 // ─── 静态文件服务 ─────────────────────────────────────────────────────
-function serveFile(filePath, contentType) {
+async function serveFile(filePath, contentType) {
   if (!existsSync(filePath)) return new Response("Not Found", { status: 404 });
-  return new Response(Bun.file(filePath), {
-    headers: { "Content-Type": contentType },
-  });
+  
+  const fileObj = file(filePath);
+
+  try {
+    const chunks = [];
+    for await (const chunk of fileObj) {
+      chunks.push(chunk);
+    }
+    const content = Buffer.concat(chunks);
+    return new Response(content, {
+      headers: { "Content-Type": contentType },
+    });
+  } catch (e) {
+    log(`ServeFile error: ${e.message}`);
+    return new Response("Internal Server Error", { status: 500 });
+  }
 }
 
 // ─── 请求处理器 ─────────────────────────────────────────────────────────
 async function handleFetch(req) {
   const url  = new URL(req.url);
-  // fnOS gateway 反向代理不剥路径前缀（/app/{appname}/），这里手动剥离
-  const path = url.pathname.replace(/^\/app\/[^/]+/, "") || "/";
+  // fnOS gateway 反向代理不剥路径前缀（/app/{appname}/），这里手动剥离并归一化
+  const path = url.pathname.replace(/^\/app\/[^/]+/, "").replace(/\/+$/, "") || "/";
 
   // CORS 预检
   if (req.method === "OPTIONS") {
@@ -1967,19 +2154,24 @@ async function handleFetch(req) {
       // 每次检查都重新运行 hermes --version，确保版本准确（不依赖缓存）
       let current = HERMES_VERSION;
       try {
-        const { spawnSync } = require("bun");
-        const vr = spawnSync([HERMES_BIN, "--version"], { stdout: "pipe", stderr: "pipe" });
+        const vr = spawnSync(HERMES_BIN_PATH, ["--version"], { stdout: "pipe", stderr: "pipe" });
         const vOut = ((vr.stdout ? vr.stdout.toString() : "").trim())
                   || ((vr.stderr ? vr.stderr.toString() : "").trim());
         if (vOut) {
           current = formatHermesVersion(vOut);
           if (current !== HERMES_VERSION) {
             HERMES_VERSION = current;
-            try { writeFileSync(VERSION_FILE, current, { mode: 0o644 }); } catch {}
-            log(`版本已刷新(check): ${current}`);
+            try { writeFileSync(VERSION_FILE, current, { mode: 0o644 }); } catch (e2) {
+              log(`[更新检查] 写入版本缓存失败: ${e2.message}`);
+            }
+            log(`版本已刷新 (check): ${current}`);
           }
+        } else if (vr.error) {
+          log(`[更新检查] hermes --version 执行失败: ${vr.error.message}`);
         }
-      } catch {}
+      } catch (e) {
+        log(`[更新检查] 版本探测异常: ${e.message}`);
+      }
       const currentVer = current.replace(/^v/, "").split(" ")[0];
       let latest = "unknown";
       let latestDate = "";
@@ -2111,8 +2303,7 @@ async function handleFetch(req) {
     let currentVer = HERMES_VERSION;
     if (updateState === "done") {
       try {
-        const { spawnSync } = require("bun");
-        const verResult = spawnSync([HERMES_BIN, "--version"], { stdout: "pipe", stderr: "pipe" });
+        const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], { stdout: "pipe", stderr: "pipe" });
         const verOut = ((verResult.stdout ? verResult.stdout.toString() : "").trim())
                     || ((verResult.stderr ? verResult.stderr.toString() : "").trim());
         if (verOut) {
@@ -2185,7 +2376,7 @@ async function handleFetch(req) {
     await stopPid(PID_DASHBOARD);
     // 强制杀掉残留的 dashboard 进程（PID 文件可能已失效）
     try {
-      const proc = spawn(["pkill", "-SIGKILL", "-f", "hermes.*dashboard"]);
+      const proc = spawn(["pkill", "-SIGKILL", "-f", "hermes-agent.*dashboard"]);
       await proc.exited;
     } catch {}
     if (dbAlive) log("Dashboard stopped (pid=" + dbAlive + ")");
@@ -2486,7 +2677,7 @@ async function handleFetch(req) {
         const existingEntry = allProvConfig[p.id];
         const incomingName = (p.name && String(p.name).trim()) || "";
         // base_url：A 类内置商强制存 PROVIDER_PRESETS 默认 URL（编辑框只读，地址由 Hermes 管理），
-        // B 类/custom 存用户填写值；确保 providers-state.yaml 对所有商都保存完整 URL 供编辑框回显。iranee
+        // B 类/custom 存用户填写值；确保 providers-state.yaml 对所有商都保存完整 URL 供编辑框回显。
         let baseUrl;
         if (PROVIDER_CLASSES[p.id] === "A" && PROVIDER_PRESETS[p.id]) {
           baseUrl = PROVIDER_PRESETS[p.id].base_url || "";
@@ -2547,7 +2738,7 @@ async function handleFetch(req) {
         return risky ? JSON.stringify(s) : s;
       };
 
-      // ── 构建 providers: 段（A/B 分类，详见 provider-config.js 的 PROVIDER_CLASSES）iranee ──
+      // ── 构建 providers: 段（A/B 分类，详见 provider-config.js 的 PROVIDER_CLASSES） ──
       //   A 类内置商仅写 model 段，端点与原生协议交给 Hermes 内置 PROVIDER_REGISTRY；
       //   B 类内置商（siliconflow / mistral / ollama-cloud）与所有非预设 custom-* 必须写 providers 段。
       const customEntries = Object.entries(allProvConfig)
@@ -2565,7 +2756,7 @@ async function handleFetch(req) {
           }
           // 本地模型（local-* 动态 id）：本地 OpenAI 兼容服务无需鉴权，
           // 仅写 base_url + default_model，完全省略 api_key（Hermes config.py 支持缺省，
-          // runtime_provider.py 会自动兜底 "no-key-required" 占位）。iranee
+          // runtime_provider.py 会自动兜底 "no-key-required" 占位）。
           if (String(id).indexOf("local-") === 0) {
             return `  ${id}:\n` +
                    `    base_url: ${yamlScalar(baseUrl)}\n` +
@@ -2596,7 +2787,7 @@ async function handleFetch(req) {
 
         // 同步 providers: 段——兼容模板里的 `providers: {}` 空映射与已存在的多行块两种形态，
         // 避免产生重复的 providers 顶层键。无 B/custom 条目时整段省略 providers 节，
-        // A 类 active 且无自定义商时 config.yaml 只保留 model 段（贴合用户实机验证格式）。iranee
+        // A 类 active 且无自定义商时 config.yaml 只保留 model 段（贴合用户实机验证格式）。
         const _NL = String.fromCharCode(10);
         const _TAB = String.fromCharCode(9);
         const _yl = ymlContent.split(_NL);
@@ -3162,8 +3353,9 @@ async function gracefulShutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   log("Received SIGTERM, shutting down gateway + dashboard ...");
-  await stopPid(PID_GATEWAY);
-  await stopPid(PID_DASHBOARD);
+  await Promise.all([stopPid(PID_GATEWAY), stopPid(PID_DASHBOARD)]);
+  // 兜底：PID 文件丢失/过期时 pkill 按路径模式清理残留进程
+  await forceKillHermes();
   log("Shutdown complete");
   process.exit(0);
 }
@@ -3173,12 +3365,53 @@ process.on("SIGINT",  () => gracefulShutdown());
 // ─── 崩溃保护：记录错误而非退出 ─────────────────────────
 process.on("uncaughtException", (err) => {
   log(`[FATAL] uncaughtException: ${err?.message || err}\n${err?.stack || ""}`);
+  if (err?.code === "EADDRINUSE") {
+    // 真正的竞态：两个实例几乎同时通过了上面的存活检测。此时不能继续
+    // 假装"Monitor ready"，否则会得到一个端口/socket 都没绑定成功、
+    // 但进程仍在运行的僵尸实例，外部很难察觉。直接退出，交给外部的
+    // 重启策略处理。
+    log(`[FATAL] socket 绑定冲突，退出进程`);
+    process.exit(1);
+  }
 });
 process.on("unhandledRejection", (err) => {
   log(`[FATAL] unhandledRejection: ${err?.message || err}\n${err?.stack || ""}`);
 });
 
-Bun.serve({
+// ─── 单实例保护：绑定 unix socket 前先探测是否已有存活实例 ─────────────
+// 之前的问题：serve() 对 unix socket 的 listen 是异步的，EADDRINUSE 只会以
+// uncaughtException 的形式在"Monitor ready"日志打印之后才出现——导致重复启动时
+// 出现两份完全相同的启动日志，其中一个进程实际上从未真正监听成功，却又不会退出，
+// 变成一个"看起来活着但什么也没做"的僵尸进程。这里改为：启动前主动探测 socket
+// 文件是否真的有进程在监听；如果有，直接退出，避免抢占；如果只是残留的旧文件
+//（上次进程被 kill -9 等方式非正常终止，没来得及清理），先删除再正常绑定。
+function checkSocketAlive(path) {
+  return new Promise((resolve) => {
+    const sock = net.connect(path);
+    const finish = (alive) => {
+      try { sock.destroy(); } catch {}
+      resolve(alive);
+    };
+    sock.once("connect", () => finish(true));
+    sock.once("error", () => finish(false));
+    setTimeout(() => finish(false), 1000);
+  });
+}
+
+if (existsSync(SOCKET_PATH)) {
+  const alive = await checkSocketAlive(SOCKET_PATH);
+  if (alive) {
+    log(`[FATAL] 检测到另一个 monitor 实例已在监听 ${SOCKET_PATH}，本进程退出以避免重复启动`);
+    process.exit(1);
+  } else {
+    log(`[启动清理] 发现残留的 socket 文件（无进程监听），已删除：${SOCKET_PATH}`);
+    try { unlinkSync(SOCKET_PATH); } catch (e) {
+      log(`[启动清理] 删除残留 socket 文件失败: ${e.message}`);
+    }
+  }
+}
+
+serve({
   fetch(req, server) {
     const url = new URL(req.url);
     const wsPath = url.pathname.replace(/^\/app\/[^/]+/, "") || "/";

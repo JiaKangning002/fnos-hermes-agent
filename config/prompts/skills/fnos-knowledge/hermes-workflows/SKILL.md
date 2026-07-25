@@ -17,7 +17,7 @@ description: Hermes 通用工作流与运维巡检/删除决策规范。涵盖�
 当需要用户扫码时，**必须用 `[qr](URL)` 格式**：
 
 ```markdown
-✅ [qr](https://liteapp.weixin.qq.com/q/bot_type=3&token=abc123)  → 渲染为可扫描二维码按钮
+✅ [qr](https://liteapp.weixin.qq.com/q/<short_path>?qrcode=<qrcode_string>&bot_type=3)  → 渲染为可扫描二维码按钮
 ❌ [QR](url) / [二维码](url) → 不会渲染
 ❌ 字符画二维码 → 无法扫描
 ```
@@ -58,8 +58,10 @@ description: Hermes 通用工作流与运维巡检/删除决策规范。涵盖�
 
 ### 2.1 Python 脚本模板
 
+> ⚠️ **不要用 print hook 抓 URL**：`qr_login` 只 `print` 裸 `uuid`（约 40-50 位混合字符），完整二维码 URL 从不被 print。必须用它**返回的 dict**（`{bot_type, uuid, qrcode_string, short_path}`）在调用端自行拼接，否则会得到缺少 `?qrcode=...&bot_type=...` query 的废 URL（且腾讯对错误 URL 也返回 200，不能靠状态码判真伪）。
+
 ```python
-import asyncio, sys, os, json, builtins
+import asyncio, sys, os, json
 
 DATA_DIR = os.environ.get("TRIM_PKGHOME", "/var/apps/hermes-agent/home") + "/data"
 os.environ["HERMES_HOME"] = DATA_DIR
@@ -67,24 +69,21 @@ sys.path.insert(0, DATA_DIR + "/venv/lib/python3.11/site-packages")
 from gateway.platforms.weixin import qr_login
 
 QR_FILE = "/tmp/hermes_weixin_qr.txt"
+
+# qr_login 返回 dict：{bot_type, uuid, qrcode_string, short_path}
+# 完整二维码 URL 必须由调用端用这些字段拼接，绝不能靠 print hook 抓
+res = qr_login(DATA_DIR, bot_type="3", timeout_seconds=300)
+if asyncio.iscoroutine(res):          # 兼容 qr_login 为协程/普通函数两种实现
+    res = asyncio.run(res)
+
+qrcode_url = "https://liteapp.weixin.qq.com/q/{short_path}?qrcode={qrcode_string}&bot_type={bot_type}".format(
+    short_path=res["short_path"], qrcode_string=res["qrcode_string"], bot_type=res["bot_type"])
+
 with open(QR_FILE, "w") as f:
-    f.write("")
-
-_orig_print = builtins.print
-def _hooked_print(*a, **kw):
-    _orig_print(*a, **kw)
-    for arg in a:
-        s = str(arg)
-        if s.startswith("https://liteapp.weixin.qq.com/q/"):
-            with open(QR_FILE, "w") as f:
-                f.write(s + "\n")
-
-builtins.print = _hooked_print
-result = asyncio.run(qr_login(DATA_DIR, timeout_seconds=300))
-_orig_print("RESULT:", result)
-if result:
-    with open("/tmp/hermes_weixin_cred.json", "w") as f:
-        json.dump(result, f)
+    f.write(qrcode_url + "\n")
+print("QRCODE_URL:", qrcode_url)
+with open("/tmp/hermes_weixin_cred.json", "w") as f:
+    json.dump(res, f)
 ```
 
 保存位置：`/tmp/weixin_bind.py`
@@ -94,7 +93,7 @@ if result:
 1. **检查已有绑定**：`ls "$TRIM_PKGHOME/data/weixin/accounts/*.json" 2>/dev/null`
 2. **后台启动**：`cd "${TRIM_PKGHOME:-/var/apps/hermes-agent/home}/data" && nohup python3 /tmp/weixin_bind.py > /tmp/weixin_bind.log 2>&1 &`
 3. **等 2-5 秒读取 QR URL**：`sleep 2 && cat /tmp/hermes_weixin_qr.txt`
-4. **输出二维码按钮**：`[qr](https://liteapp.weixin.qq.com/q/<url>)`
+4. **输出二维码按钮**：`QR_FILE` 里已是**完整 URL**，直接原样输出 `[qr](<QR_FILE 里的完整URL>)`，不要再拼 `https://liteapp.weixin.qq.com/q/` 前缀
 5. **验证扫码成功**（权威判据是 `weixin/accounts/*.json` 落盘）：
    ```bash
    stat "$TRIM_PKGHOME/data/weixin/accounts/"*.json
@@ -414,8 +413,8 @@ rm /vol1/1000/alice/文件.txt                               # 永久删除，�
 
 ### 问题 1：二维码扫不上去
 
-**原因**：URL 折行拼接失败  
-**解决**：脚本须处理折行拼接，确保完整 URL 写入 QR_FILE。
+**原因**：URL 缺少 `?qrcode=<qrcode_string>&bot_type=<bot_type>` query（旧脚本用 print hook 抓到的是 `qr_login` print 出来的裸 `uuid`，完整 URL 从不被 print）  
+**解决**：改用 `qr_login` 返回的 dict 在调用端拼完整 URL（见 2.1），不要 hook print；注意腾讯对错误 URL 也返回 200，不能靠 curl 状态码判真伪。
 
 ### 问题 2：Dashboard 卡在 listen 但打不开
 

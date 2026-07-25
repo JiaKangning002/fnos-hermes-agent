@@ -4,7 +4,9 @@
   <meta charset="UTF-8">
   <base href="/app/hermes-agent/">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="mobile-web-app-capable" content="yes">
+  <!-- iOS Safari 专用：防止输入框被键盘遮挡 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" sizes="64x64" href="images/64.png">
   <title>Hermes Agent</title>
   <script src="scripts/marked.min.js"></script>
@@ -338,6 +340,18 @@
     .sess-del:hover{background:var(--red-bg);color:var(--red)}
     .sess-del.confirming{display:flex;background:var(--red);color:var(--text-inverse);font-weight:700}
 
+    /* ─── iOS Safari 专用 - 聊天输入区域 ───────────────────── */
+    @supports (padding-bottom: env(safe-area-inset-bottom)) {
+      .chat-main {
+        padding-bottom: env(safe-area-inset-bottom, 0);
+      }
+      
+      .chat-messages {
+        scrollbar-width: thin !important;
+        -webkit-overflow-scrolling: touch;
+      }
+    }
+    
     .chat-main{flex:1;display:flex;flex-direction:column;background:var(--bg0);overflow:hidden;min-height:0}
     .chat-messages{flex:1;overflow-y:auto;padding:16px;min-height:0}
     .chat-messages::-webkit-scrollbar{width:5px}
@@ -484,6 +498,24 @@
     }
     .chat-composer-row{display:flex;gap:6px;align-items:flex-end;width:100%}
     .chat-composer-inner:focus-within{border-color:var(--blue)}
+    
+    /* ─── iOS Safari 专用 - 键盘遮挡修复 ───────────────────── */
+    @supports (padding-bottom: env(safe-area-inset-bottom)) {
+      /* 始终为移动端增加底部 padding，无论 body 是否有 class */
+      .chat-composer-inner {
+        padding-bottom: calc(20px + env(safe-area-inset-bottom, 20px));
+      }
+      
+      .chat-input {
+        padding-bottom: 8px !important;
+      }
+      
+      .chat-messages {
+        padding-bottom: calc(80px + env(safe-area-inset-bottom, 40px)) !important;
+      }
+    }
+    
+    /* 基础布局 */
     .chat-input{flex:1;resize:none;border:none;border-radius:0;padding:8px 0;
       font-size:14px;font-family:inherit;background:transparent;color:var(--text);
       line-height:1.5;max-height:200px}
@@ -519,6 +551,19 @@
       width:fit-content;box-shadow:var(--shadow)}
     .msg-qr-box.show{display:block}
     .msg-qr-box canvas{display:block}
+
+    /* ─── 更新栏 QQ 交流群按钮 + 二维码浮层 ─── */
+    .qq-group-wrap{position:relative;display:inline-flex;margin-left:auto}
+    .qq-group-btn{display:inline-flex;align-items:center;gap:5px;padding:7px 12px;font-size:13px;
+      color:var(--text3);background:transparent;border:1px solid var(--border);border-radius:7px;
+      cursor:pointer;transition:all .15s;white-space:nowrap}
+    .qq-group-btn:hover{color:var(--accent);border-color:var(--accent-border);background:var(--accent-bg)}
+    .qq-group-pop{position:fixed;left:0;top:0;display:none;z-index:9999;
+      padding:10px;background:var(--bg1);border:1px solid var(--border);border-radius:10px;
+      box-shadow:var(--shadow)}
+    .qq-group-pop.show{display:block}
+    .qq-group-pop img{display:block;width:180px;height:auto;border-radius:6px}
+    .qq-group-pop .qq-group-cap{margin-top:6px;text-align:center;font-size:11px;color:var(--text3)}
 
     /* ─── Dashboard 开关 ─── */
     .dash-toggle-label{font-size:11px;color:var(--text3);white-space:nowrap;transition:color .2s}
@@ -843,9 +888,19 @@
               </div>
             </div>
             <!-- 按钮 -->
-            <div style="display:flex;gap:8px;margin-top:16px">
+            <div style="display:flex;gap:8px;margin-top:16px;align-items:center">
               <button class="btn" id="checkUpdateBtn" onclick="checkHermesUpdate()" style="font-size:13px">检查更新</button>
               <button class="btn" id="doUpdateBtn" onclick="confirmHermesUpdate()" style="display:none;font-size:13px;background:var(--accent);color:#fff;border:none">更新</button>
+              <span class="qq-group-wrap" onmouseenter="showQQGroup()" onmouseleave="hideQQGroup()">
+                <button type="button" class="qq-group-btn" onclick="toggleQQGroup(event)" aria-label="QQ 交流群">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                  QQ 群
+                </button>
+                <div class="qq-group-pop" id="qqGroupPop" onmouseenter="qqGroupPopEnter()" onmouseleave="qqGroupPopLeave()">
+                  <img src="scripts/qq_group.webp" alt="QQ 交流群二维码">
+                  <div class="qq-group-cap">扫码加入 QQ 交流群</div>
+                </div>
+              </span>
             </div>
             <!-- 更新进度 -->
             <div id="updateProgress" style="display:none;margin-top:16px">
@@ -964,11 +1019,11 @@
         </div>
         <div class="form-group" id="modelGroup">
           <label>模型</label>
-          <div style="font-size:11px;color:var(--text3);margin-bottom:6px" id="modelHint">从下拉列表选择，或选择"自定义模型"手动输入名称</div>
+          <div style="font-size:11px;color:var(--text3);margin-bottom:6px" id="modelHint">下拉列表选择模型或手动输入，点击『测试连接』自动加载可用模型</div>
           <select id="modelSelect" onchange="settingsOnModelSelectChange(this.value)"></select>
           <div id="modelCustomWrap" style="display:none;margin-top:6px">
             <input id="modelInput" placeholder="输入自定义模型名称..." style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text1)">
-            <div id="modelBackToListWrap" style="margin-top:4px"><a href="javascript:void(0)" onclick="settingsBackToModelList()" style="font-size:12px;color:var(--accent)">← 返回下拉列表选择</a></div>
+            <div id="modelBackToListWrap" style="margin-top:8px;display:flex;justify-content:flex-end"><button type="button" onclick="settingsBackToModelList()" style="display:inline-flex;align-items:center;gap:4px;padding:5px 10px;font-size:12px;color:var(--text2);background:var(--bg2);border:1px solid var(--border);border-radius:6px;cursor:pointer;transition:all .15s" onmouseover="this.style.color='var(--accent)';this.style.borderColor='var(--accent-border)'" onmouseout="this.style.color='var(--text2)';this.style.borderColor='var(--border)'"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>返回下拉列表</button></div>
           </div>
         </div>
         <div class="form-row" id="paramsGroup">
@@ -1056,6 +1111,9 @@
 
   // ─── 视图切换 ───
   window.switchView = function(view){
+    // 切换视图时关闭仍打开的「添加/编辑模型」弹窗，避免手机端切到概览/更新后弹窗仍浮在页面上
+    var _pm = document.getElementById('providerModal');
+    if(_pm) _pm.classList.remove('show');
     document.querySelectorAll('.view').forEach(function(v){ v.classList.remove('active'); });
     document.querySelectorAll('.nav-item').forEach(function(n){ n.classList.remove('active'); });
     var el = document.getElementById('view' + view.charAt(0).toUpperCase() + view.slice(1));
@@ -1070,7 +1128,13 @@
       if(_drawer) _drawer.classList.remove('open');
       if(_overlay) _overlay.classList.remove('open');
     }
-    if (window.__deepLinked) { window.__deepLinked = false; } else { try { localStorage.setItem('hermes_view', view); } catch(e){} }
+    if (window.__deepLinked) { window.__deepLinked = false; } else {
+      try { localStorage.setItem('hermes_view', view); } catch(e){}
+      // 用户主动切换视图：清理 URL 参数，防止刷新时深链重复跳转
+      if (window.location.search) {
+        try { history.replaceState(null, '', window.location.pathname); } catch(e){}
+      }
+    }
     if(view === 'chat'){
       if(!wasActive){
         if(chatState.inited){
@@ -1762,6 +1826,60 @@
       if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); chatSend(); }
       else if(e.key === 'Escape'){ chatStop(); }
     });
+    
+    // ─── iOS Safari 专用 - 输入框聚焦时自动滚动到底部 ───
+    if(/iPad|iPod|iPhone/i.test(navigator.userAgent)){
+      input.addEventListener('focus', function(){
+        // 延迟执行以确保键盘已弹出
+        setTimeout(function(){
+          var box = document.getElementById('chatMessages');
+          if(box) {
+            box.scrollTop = box.scrollHeight;
+          }
+        }, 300);
+      });
+    }
+    
+    // ─── 截图粘贴功能 ───────────────────────────────────────────────
+    input.addEventListener('paste', async function(e){
+      var items = (e.clipboardData || e.originalEvent.clipboardData).items;
+      if(!items || !items.length) return;
+      
+      var foundImage = false;
+      for(var i=0; i<items.length; i++){
+        var item = items[i];
+        if(item.type && item.type.indexOf('image') !== -1){
+          foundImage = true;
+          var blob = item.getAsFile();
+          var reader = new FileReader();
+          reader.onload = function(ev){
+            var attachment = {
+              name: 'paste-' + Date.now() + '.png',
+              type: blob.type || 'image/png',
+              size: blob.size,
+              dataUrl: ev.target.result,
+              url: null,
+            };
+            chatAttachments.push(attachment);
+            var idx = chatAttachments.length - 1;
+            attachment._uploadPromise = uploadImageFile(blob).then(function(out){
+              chatAttachments[idx].url = out ? out.url : null;
+              chatAttachments[idx].serverPath = out ? out.path : null;
+            });
+            renderFilePreview();
+            // 清空剪贴板文本内容，避免重复插入
+            input.value = '';
+          };
+          reader.readAsDataURL(blob);
+          break; // 只处理第一张图片
+        }
+      }
+      
+      // 如果检测到图片，阻止默认行为（避免文本和图片混合粘贴）
+      if(foundImage){
+        e.preventDefault();
+      }
+    });
 
     var msgBox = document.getElementById('chatMessages');
     var backdrop = document.getElementById('imgZoomBackdrop');
@@ -2328,7 +2446,7 @@
           // 回复气泡仅显示文字
           if (fullText) {
             contentEl.innerHTML = renderMarkdown(fullText, true);
-            addCopyButtonsToPre(contentEl); contentEl.classList.add('cursor-blink');
+            addCopyButtonsToPre(contentEl); enhanceLinksWithQR(contentEl); contentEl.classList.add('cursor-blink');
           }
           if (statusBar) statusBar.textContent = tp.status === 'running'
             ? (tp.emoji || '🔧') + ' ' + (tp.toolZh || tp.tool) + '…'
@@ -2339,6 +2457,8 @@
           fullText += parsed.delta;
           contentEl.innerHTML = renderMarkdown(fullText, true);
           addCopyButtonsToPre(contentEl);
+          // 流式过程中即为已完整的 [qr](url) 链接补上二维码按钮，无需等回复结束
+          enhanceLinksWithQR(contentEl);
           if (wasEmpty) contentEl.classList.add('cursor-blink');
           if (statusBar) statusBar.textContent = 'Hermes 正在回复…';
           (window.requestAnimationFrame || setTimeout)(function(){ scrollChatToBottom(); }, 0);
@@ -2590,13 +2710,13 @@
       : DEFAULT_PRESETS;
   }
 
-  // A 类内置商 base_url 只读（端点由 Hermes 内置 registry 管理），B 类/custom 可手动编辑。iranee
+  // A 类内置商 base_url 只读（端点由 Hermes 内置 registry 管理），B 类/custom 可手动编辑。
   function settingsIsReadonlyBaseUrl(providerId){
     var classes = (settingsState.config && settingsState.config.provider_classes) || {};
     return classes[providerId] === 'A';
   }
 
-  // 按 A/B 分类设置 base_url 输入框的可编辑性与提示（只读态置灰 + 说明）。iranee
+  // 按 A/B 分类设置 base_url 输入框的可编辑性与提示（只读态置灰 + 说明）。
   function settingsApplyBaseUrlMode(providerId){
     var input = document.getElementById('baseUrlInput');
     if(!input) return;
@@ -2767,6 +2887,9 @@
     var select = document.getElementById('modelSelect');
     var customWrap = document.getElementById('modelCustomWrap');
     var input = document.getElementById('modelInput');
+    // 每次(重新)填充模型下拉即复位提示文案，清除上一个服务商测试连接留下的成功反馈
+    var _mh = document.getElementById('modelHint');
+    if(_mh){ _mh.textContent = '下拉列表选择模型或手动输入，点击『测试连接』自动加载可用模型'; _mh.style.color = 'var(--text3)'; }
     var models = PROVIDER_MODELS[presetId] || [];
     // 自定义商（custom-* / "custom" / 无预置模型）：模型名只能手动文本输入。
     // 隐藏下拉与“返回下拉列表选择”入口，避免点返回后下拉只剩一个已选项、onchange 不触发而无法再输入。
@@ -2812,6 +2935,54 @@
     }
   }
 
+  // #75 测试连接成功后，把返回的模型合并进模型下拉；始终保留用户手动填写的模型名
+  function settingsMergeTestedModels(testedIds){
+    var select = document.getElementById('modelSelect');
+    var customWrap = document.getElementById('modelCustomWrap');
+    var input = document.getElementById('modelInput');
+    var backWrap = document.getElementById('modelBackToListWrap');
+    if(!select || !input) return;
+    // 归一化测试返回的模型 id：去空、去重
+    var seen = {}, tested = [];
+    (testedIds || []).forEach(function(id){
+      id = (id == null ? '' : String(id)).trim();
+      if(id && !seen[id]){ seen[id] = 1; tested.push(id); }
+    });
+    // 当前 provider（编辑态取已存 id，新增态取所选预设）
+    var editing = (settingsState.editingIndex >= 0) ? settingsState.config.providers[settingsState.editingIndex] : null;
+    var presetId = editing ? editing.id : settingsState.selectedPreset;
+    // 用户已填/已选的模型（务必保留）
+    var manual = input.value.trim();
+    if(!manual && select.value && select.value !== '__custom__') manual = select.value;
+    // 预置模型（A 类）+ 测试发现的模型，合并去重
+    var merged = (PROVIDER_MODELS[presetId] || []).slice();
+    var mseen = {};
+    merged.forEach(function(m){ mseen[m] = 1; });
+    tested.forEach(function(id){ if(!mseen[id]){ mseen[id] = 1; merged.push(id); } });
+    // 手动填写的模型若不在列表，并入以防丢失
+    if(manual && !mseen[manual]){ mseen[manual] = 1; merged.push(manual); }
+    if(!merged.length) return;
+    // 回写运行时模型表，切换/重开仍可见
+    if(presetId) PROVIDER_MODELS[presetId] = merged;
+    // 渲染下拉（附“+ 自定义模型...”），并选中用户此前的模型
+    var html = '';
+    merged.forEach(function(m){ html += '<option value="' + escapeHtml(m) + '">' + escapeHtml(m) + '</option>'; });
+    html += '<option value="__custom__">+ 自定义模型...</option>';
+    select.innerHTML = html;
+    if(backWrap) backWrap.style.display = '';
+    var chosen = manual || merged[0];
+    select.value = chosen;
+    select.style.display = '';
+    customWrap.style.display = 'none';
+    input.value = chosen;
+    // 测试连接后把提示改成成功反馈，直观告知已获取并加入列表的模型数量
+    var hint = document.getElementById('modelHint');
+    if(hint && tested.length){
+      hint.textContent = '已获取 ' + tested.length + ' 个模型，并添加到列表';
+      hint.style.color = 'var(--green)';
+    }
+  }
+
   window.settingsOnModelSelectChange = function(val){
     var input = document.getElementById('modelInput');
     var customWrap = document.getElementById('modelCustomWrap');
@@ -2834,6 +3005,13 @@
     document.getElementById('modelInput').value = (select.value === '__custom__') ? '' : select.value;
   };
 
+  // 未选服务商（presetId 为空）时禁用「测试连接」「保存」，选择后启用
+  function settingsSetActionButtonsEnabled(enabled){
+    var testBtn = document.querySelector('#providerForm button[onclick="settingsTestConnection()"]');
+    var saveBtn = document.querySelector('#providerForm button[type="submit"]');
+    if(testBtn) testBtn.disabled = !enabled;
+    if(saveBtn) saveBtn.disabled = !enabled;
+  }
   window.settingsSelectPreset = function(presetId){
     settingsState.selectedPreset = presetId;
     // 防坑：从本地模式切回普通预设/自定义时，恢复 API Key 分组与预设分组的显示
@@ -2879,6 +3057,8 @@
     keyInput.placeholder = 'sk-...';
     // 重置测试结果
     document.getElementById('formTestResult').textContent = '';
+    // 仅当选中有效服务商（预设/自定义）时启用测试连接与保存按钮
+    settingsSetActionButtonsEnabled(!!presetId);
   };
 
   // --- #28 从 base_url 自动提取自定义供应商名 ---
@@ -2964,6 +3144,8 @@
       if(testBtn) testBtn.style.display = '';
       var saveBtn = document.querySelector('#providerForm button[type="submit"]');
       if(saveBtn) saveBtn.textContent = '保存';
+      // 本地模型已确定服务商类型，启用测试连接与保存
+      settingsSetActionButtonsEnabled(true);
       document.getElementById('providerModal').classList.add('show');
     });
   };
@@ -2982,6 +3164,8 @@
       document.getElementById('apiKeyInput').value = '';
       document.getElementById('keyHint').textContent = '';
       document.getElementById('btnDeleteProv').style.display = 'none';
+      // 新增服务商时同时隐藏"设为默认"按钮（只有编辑现有服务时才可能显示）
+      document.getElementById('btnSetDefault').style.display = 'none';
       document.getElementById('formTestResult').textContent = '';
       // 重置模型下拉列表
       settingsPopulateModelSelect('', '');
@@ -2999,6 +3183,8 @@
       document.getElementById('paramsGroup').style.display = 'none';
       var testBtn = document.querySelector('#providerForm button[onclick="settingsTestConnection()"]');
       if (testBtn) testBtn.style.display = '';
+      // 新增服务商初始未选服务商，禁用测试连接与保存
+      settingsSetActionButtonsEnabled(false);
       document.getElementById('providerModal').classList.add('show');
     });
   };
@@ -3069,11 +3255,73 @@
     saveBtn.textContent = '保存';
     document.getElementById('formTestResult').textContent = '';
     settingsState.selectedPreset = p.id || '';
+    // 编辑态已有服务商，启用测试连接与保存
+    settingsSetActionButtonsEnabled(true);
     document.getElementById('providerModal').classList.add('show');
   };
 
   window.settingsCloseModal = function(){
     document.getElementById('providerModal').classList.remove('show');
+  };
+
+  // QQ 交流群二维码浮层：用 fixed 定位避免被 .card 的 overflow:hidden 裁切
+  var qqGroupHideTimer = null;
+  function positionQQGroupPop(){
+    var pop = document.getElementById('qqGroupPop');
+    var wrap = pop && pop.closest('.qq-group-wrap');
+    var btn = wrap && wrap.querySelector('.qq-group-btn');
+    if(!pop || !btn) return;
+    var r = btn.getBoundingClientRect();
+    // 先临时可见化以量取尺寸
+    pop.style.visibility = 'hidden';
+    pop.style.display = 'block';
+    var pw = pop.offsetWidth, ph = pop.offsetHeight;
+    pop.style.display = '';
+    pop.style.visibility = '';
+    var left = Math.max(8, r.right - pw);
+    var top = r.bottom + 8;
+    if(top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 8);
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+  }
+  function cancelHideQQGroup(){
+    if(qqGroupHideTimer){ clearTimeout(qqGroupHideTimer); qqGroupHideTimer = null; }
+  }
+  window.showQQGroup = function(){
+    var pop = document.getElementById('qqGroupPop');
+    if(!pop) return;
+    cancelHideQQGroup();
+    positionQQGroupPop();
+    pop.classList.add('show');
+  };
+  window.hideQQGroup = function(){
+    // 延迟隐藏：鼠标从按钮移走后留出时间挪到图片上，避免图片立即消失
+    cancelHideQQGroup();
+    qqGroupHideTimer = setTimeout(function(){
+      var pop = document.getElementById('qqGroupPop');
+      if(pop) pop.classList.remove('show');
+      qqGroupHideTimer = null;
+    }, 320);
+  };
+  // 鼠标移到二维码图片浮层上时保持显示，从图片上移走后再延迟隐藏
+  window.qqGroupPopEnter = function(){ cancelHideQQGroup(); };
+  window.qqGroupPopLeave = function(){ window.hideQQGroup(); };
+  window.toggleQQGroup = function(e){
+    if(e) e.stopPropagation();
+    var pop = document.getElementById('qqGroupPop');
+    if(!pop) return;
+    if(pop.classList.contains('show')){ pop.classList.remove('show'); return; }
+    cancelHideQQGroup();
+    positionQQGroupPop();
+    pop.classList.add('show');
+    var closer = function(ev){
+      var wrap = pop.closest('.qq-group-wrap');
+      if(wrap && !wrap.contains(ev.target) && !pop.contains(ev.target)){
+        pop.classList.remove('show');
+        document.removeEventListener('click', closer);
+      }
+    };
+    setTimeout(function(){ document.addEventListener('click', closer); }, 0);
   };
 
   window.settingsToggleKeyVisibility = function(){
@@ -3269,6 +3517,8 @@
         var models = out.models.slice(0,5).map(function(m){ return m.id; }).join(', ');
         result.textContent = '连接成功 (' + out.latency + 'ms) · ' + out.models.length + ' 个可用模型' + (models ? ': ' + models : '') + (out.models.length > 5 ? '...' : '');
         result.className = 'form-test success';
+        // #75 把测试发现的模型合并进模型下拉，保留手动填写的模型名
+        settingsMergeTestedModels((out.models || []).map(function(m){ return m.id; }));
       }
     }).catch(function(e){
       result.textContent = '连接失败: ' + e.message;
@@ -3332,6 +3582,7 @@
     var curEl = document.getElementById('updateCurrentVer');
     var latEl = document.getElementById('updateLatestVer');
     var doBtn = document.getElementById('doUpdateBtn');
+    var alreadyLatest = false; // 已是最新时临时禁用检查按钮，防止重复点击
     if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
     if (latEl) { latEl.textContent = '检查中…'; latEl.style.color = 'var(--text3)'; }
     if (doBtn) doBtn.style.display = 'none';
@@ -3347,8 +3598,9 @@
           if (latCard) latCard.style.borderColor = 'var(--accent)';
         } else {
           latEl.textContent = '已是最新';
-          latEl.style.color = 'var(--text2)';
+          latEl.style.color = 'var(--green)';
           if (latCard) latCard.style.borderColor = 'var(--border-subtle)';
+          alreadyLatest = true;
         }
       }
       if (data.updateAvailable && doBtn) {
@@ -3359,7 +3611,15 @@
       if (latEl) { latEl.textContent = '检查失败'; latEl.style.color = 'var(--red)'; }
       console.error('update check failed:', err);
     }).finally(function() {
-      if (btn) { btn.disabled = false; btn.textContent = '检查更新'; }
+      if (btn) {
+        if (alreadyLatest) {
+          // 确已检测到最新版本：按钮保持「检查更新」文案但持续禁用，直到刷新/重开页面才恢复
+          btn.textContent = '检查更新';
+          btn.disabled = true;
+        } else {
+          btn.disabled = false; btn.textContent = '检查更新';
+        }
+      }
     });
   };
 
@@ -3446,7 +3706,7 @@
             if (statusText) statusText.textContent = '更新完成，Gateway 已重启';
             if (chkBtn) chkBtn.disabled = false;
             var latEl = document.getElementById('updateLatestVer');
-            if (latEl) { latEl.textContent = '已是最新'; latEl.style.color = 'var(--text2)'; }
+            if (latEl) { latEl.textContent = '已是最新'; latEl.style.color = 'var(--green)'; }
           }, 3000);
         }).catch(function() {
           if (statusText) { statusText.textContent = '更新完成，但重启失败，请手动重启'; statusText.style.color = 'var(--red)'; }
