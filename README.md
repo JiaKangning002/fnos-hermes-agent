@@ -6,6 +6,12 @@
 
 Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原生`fpk` 应用中心部署。采用基于 Bun 的 Monitor 服务进行进程管理，提供基于 Web 的控制面板用于配置和对话交互。
 
+
+## 更新提醒
+* 我们有另一个全新的版本，支持一键配置微信Claw以及各种bot，请关注：https://github.com/veenyi/fnos-hermes-agent
+* 本项目不定期更新，也可能只留存长期稳定版本
+
+  
 ## 功能特性
 
 支持多模型供应商接入（OpenRouter、OpenAI、Anthropic、Kimi、MiniMax 等）、跨平台消息网关集成（微信、Telegram、Discord、Slack、QQ、钉钉、飞书等）、带图片识别的文件操作功能，以及跨会话的对话记忆能力。
