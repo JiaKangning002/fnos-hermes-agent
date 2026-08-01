@@ -1,6 +1,7 @@
 name: Build fnOS Hermes Agent FPK
 
 on:
+  # 仅手动触发：在 GitHub Actions 页面点击 "Run workflow" 运行
   workflow_dispatch:
     inputs:
       version:
@@ -61,7 +62,7 @@ jobs:
           curl -fsSL "$FNPACK_URL" -o fnpack
           chmod +x fnpack
           mv fnpack /usr/local/bin/
-          fnpack --version
+          which fnpack
           echo "fnpack 已安装并可用"
 
       # 6. 更新 manifest 版本号
