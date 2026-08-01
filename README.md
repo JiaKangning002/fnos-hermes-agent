@@ -7,23 +7,22 @@
 Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原生`fpk` 应用中心部署。采用基于 Node.js 的 Monitor 服务进行进程管理，提供基于 Web 的控制面板用于配置和对话交互。
 
 ## 更新提醒
-* 我们有另一个全新的版本，支持一键配置微信Claw以及各种bot，请关注：https://github.com/veenyi/fnos-hermes-agent
+* 我们有另一个全新的版本，支持对话中选择专家团+工作流等，功能更多：https://github.com/veenyi/fnos-hermes-agent
 * 本项目不定期更新，也可能只留存长期稳定版本
-
   
 ## 功能特性
 
-支持多模型供应商接入（OpenRouter、OpenAI、Anthropic、Kimi、MiniMax 等）、跨平台消息网关集成（微信、Telegram、Discord、Slack、QQ、钉钉、飞书等）、带图片识别的文件操作功能，以及跨会话的对话记忆能力。
+* 支持多通讯渠道接入（微信、QQ 机器人、飞书、WhatsApp、Telegram），网页内扫码绑定，渠道独立启停
 * 支持网页端对话，支持完整的Markdown输出
-* 支持js版转换url为二维码方便扫码
+* 支持网页对话js版转换url为二维码、文本等格式的转码
 * 支持对话传入图片、文件供AGENT分析
-
-## 安装与配置
+* 支持模型回退机制，主模型故障时自动切换备用模型，保障服务连续性
+* 对话支持多窗口并行问询、超时自动提示、新窗口打开持续响应
 
 ### 环境要求
 
 - 可用存储空间：约 1GB（含 Python 依赖包和缓存）
-- 依赖项：bunjs（安装时自动处理）
+- 依赖项：Node.js v24（安装时自动处理）
 
 ### 安装步骤
 
@@ -92,7 +91,6 @@ fnOS 桌面图标 → 应用启动脚本 → Monitor (Bun, /var/apps/hermes-agen
 - 启动时会探测端口，如果默认端口**8642**或**9119**被占用，则改为**28642**和**29119** 
 - **8642** — Hermes Gateway 通信端口（内部使用，不对外暴露）
 - **9119** — Dashboard 仪表板端口（本地回环访问）
-
 
 
 ## 架构设计
