@@ -19,7 +19,8 @@ jobs:
   build-fpk:
     runs-on: ubuntu-latest
     outputs:
-      fpk_name: ${{ steps.build.outputs.fpks }}
+      fpk_full: ${{ steps.build_full.outputs.fpk_full }}
+      fpk_light: ${{ steps.build_light.outputs.fpk_light }}
       version: ${{ steps.version.outputs.version }}
 
     steps:
@@ -76,16 +77,16 @@ jobs:
       - name: Create dist directory
         run: mkdir -p dist
 
-      # 8. 打包应用
-      - name: Build FPK
-        id: build
+      # 8. 打包应用（常规版）
+      - name: Build FPK (Full)
+        id: build_full
         run: |
           FNPACK="fnpack"
           APP_DIR="$GITHUB_WORKSPACE"
+          VERSION="${{ steps.target_version.outputs.target_version }}"
           
-          echo "开始打包：${{ env.APP_NAME }}"
-          echo "目标版本：${{ steps.target_version.outputs.target_version }}"
-          echo "包目录：$APP_DIR"
+          echo "开始打包：${{ env.APP_NAME }} (完整版)"
+          echo "目标版本：v$VERSION"
           
           cd "$APP_DIR"
           
@@ -96,20 +97,69 @@ jobs:
           
           SOURCE_FPK="${{ env.APP_NAME }}.fpk"
           DIST_DIR="dist"
-          TARGET_NAME="fnos-${{ env.APP_NAME }}_v${{ steps.target_version.outputs.target_version }}.fpk"
+          TARGET_NAME="fnos-${{ env.APP_NAME }}_v${VERSION}.fpk"
           
           if [ -f "$SOURCE_FPK" ]; then
             mv "$SOURCE_FPK" "$DIST_DIR/$TARGET_NAME"
             SIZE=$(du -h "$DIST_DIR/$TARGET_NAME" | cut -f1)
             echo "打包成功：$TARGET_NAME ($SIZE)"
-            echo "fpks=$TARGET_NAME" >> $GITHUB_OUTPUT
-            echo "size=$SIZE" >> $GITHUB_OUTPUT
+            echo "fpk_full=$TARGET_NAME" >> $GITHUB_OUTPUT
+            echo "size_full=$SIZE" >> $GITHUB_OUTPUT
           else
             echo "::error:: fnpack 未生成 FPK 文件"
             exit 1
           fi
 
-      # 9. 准备 Release 说明
+      # 9. 打包轻量版（剔除 trim-cli）
+      - name: Build FPK (Lightweight, No TrimCLI)
+        id: build_light
+        run: |
+          FNPACK="fnpack"
+          APP_DIR="$GITHUB_WORKSPACE"
+          VERSION="${{ steps.target_version.outputs.target_version }}"
+          LIGHTWORK_DIR="$GITHUB_WORKSPACE-light"
+          
+          echo "开始打包：${{ env.APP_NAME }} (轻量版，无 trim-cli)"
+          echo "目标版本：v$VERSION"
+          
+          # 复制全部文件到临时目录（含隐藏文件），并移除输出目录避免把完整版 FPK 打进轻量包
+          rm -rf "$LIGHTWORK_DIR"
+          mkdir -p "$LIGHTWORK_DIR"
+          cp -a "$APP_DIR"/. "$LIGHTWORK_DIR/"
+          rm -rf "$LIGHTWORK_DIR/dist"
+          
+          # 递归删除 trim-cli 目录（如果存在）
+          if [ -d "$LIGHTWORK_DIR/config/prompts/skills/trim-cli" ]; then
+            rm -rf "$LIGHTWORK_DIR/config/prompts/skills/trim-cli"
+            echo "已删除 config/prompts/skills/trim-cli"
+          fi
+          
+          cd "$LIGHTWORK_DIR"
+          
+          if ! "$FNPACK" build --directory "$LIGHTWORK_DIR"; then
+            echo "::error:: fnpack 轻量版打包失败"
+            exit 1
+          fi
+          
+          SOURCE_FPK="${{ env.APP_NAME }}.fpk"
+          DIST_DIR="$APP_DIR/dist"
+          TARGET_NAME="fnos-${{ env.APP_NAME }}_v${VERSION}_无trimcli.fpk"
+          
+          if [ -f "$SOURCE_FPK" ]; then
+            mv "$SOURCE_FPK" "$DIST_DIR/$TARGET_NAME"
+            SIZE=$(du -h "$DIST_DIR/$TARGET_NAME" | cut -f1)
+            echo "打包成功：$TARGET_NAME ($SIZE)"
+            echo "fpk_light=$TARGET_NAME" >> $GITHUB_OUTPUT
+            echo "size_light=$SIZE" >> $GITHUB_OUTPUT
+            
+            # 清理临时工作目录
+            rm -rf "$LIGHTWORK_DIR"
+          else
+            echo "::error:: fnpack 未生成轻量版 FPK 文件"
+            exit 1
+          fi
+
+      # 10. 准备 Release 说明
       - name: Generate release notes
         id: release_notes
         run: |
@@ -121,21 +171,22 @@ jobs:
 
           echo "Release notes 已生成"
 
-      # 10. 创建 Draft Release
+      # 11. 创建 Draft Release
       - name: Create Draft Release
         id: create_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.target_version.outputs.target_version }}"
-          FPK_NAME="fnos-${{ env.APP_NAME }}_v${VERSION}.fpk"
           RELEASE_TAG="v${VERSION}"
           DIST_DIR="dist"
           
           echo "创建 Draft Release: $RELEASE_TAG"
+          echo "待上传文件："
+          ls -1 "$DIST_DIR"/*.fpk
           
           gh release create "$RELEASE_TAG" \
-            "$DIST_DIR/$FPK_NAME" \
+            "$DIST_DIR"/*.fpk \
             --draft \
             --title "$VERSION" \
             --notes-file release_body.md || exit 1
@@ -143,13 +194,14 @@ jobs:
           echo "Draft Release 已创建"
           echo "release_url=https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG" >> $GITHUB_OUTPUT
 
-      # 11. 构建摘要
+      # 12. 构建摘要
       - name: Build Summary
         run: |
           echo "### ✅ 构建完成" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 项目 | 版本 | FPK 文件名 | 大小 |" >> $GITHUB_STEP_SUMMARY
           echo "|------|------|-----------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| fnOS Hermes Agent | v${{ steps.target_version.outputs.target_version }} | fnos-hermes-agent_v${{ steps.target_version.outputs.target_version }}.fpk | ${{ steps.build.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| fnOS Hermes Agent（完整版） | v${{ steps.target_version.outputs.target_version }} | ${{ steps.build_full.outputs.fpk_full }} | ${{ steps.build_full.outputs.size_full }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| fnOS Hermes Agent（无 trimcli） | v${{ steps.target_version.outputs.target_version }} | ${{ steps.build_light.outputs.fpk_light }} | ${{ steps.build_light.outputs.size_light }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**[Draft Release](https://github.com/${{ github.repository }}/releases)** — 请确认后发布" >> $GITHUB_STEP_SUMMARY
