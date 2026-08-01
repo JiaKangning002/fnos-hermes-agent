@@ -29,7 +29,7 @@ Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原�
 1. 在飞牛应用中心添加第三方源或直接上传 `.fpk` 安装包
 2. 等待安装完成，桌面出现应用图标
 3. 点击图标打开控制面板
-4. 在「配置」页选择模型供应商并填入 API Key
+4. 在「模型」页选择模型供应商并填入 API Key
 5. 在「概览」页面，点击启动即可进行对话
 
 应用启动后自动监听内部端口，无需手动配置网络，通过应用中心的快捷入口进入。
@@ -74,7 +74,7 @@ Hermes Agent 是专为适配飞牛 NAS（fnOS）的 AI 助手应用，通过原�
 ## 进程架构
 
 ```
-fnOS 桌面图标 → 应用启动脚本 → Monitor (Bun, /var/apps/hermes-agent/server/monitor.js)
+应用启动脚本 → Monitor (Node.js, /var/apps/hermes-agent/server/monitor.js)
                                          │
                                          ├─► Unix socket: /var/apps/hermes-agent/hermes-agent.sock
                                          │                 └─► 控制面板前端 (app/ui/index.html)
@@ -105,15 +105,16 @@ fnOS 桌面图标 → 应用启动脚本 → Monitor (Bun, /var/apps/hermes-agen
 
 
 ## 截图
-![](/preview/home.png)
-![](/preview/monitor.png)
-![](/preview/chat.png)
-![](/preview/list-model.png)
-![](/preview/updote.png)
-![](/preview/dashboard-chat.png)
+![](/preview/home.webp)
+![](/preview/monitor.webp)
+![](/preview/chat.webp)
+![](/preview/list-model.webp)
+![](/preview/channels.webp)
+![](/preview/updote.webp)
+![](/preview/dashboard-chat.webp)
 
 ### QQ 交流群
-![](/preview/qq.png)
+![](/preview/qq.webp)
 
 
 
