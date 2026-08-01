@@ -1,7 +1,6 @@
 name: Build fnOS Hermes Agent FPK
 
 on:
-  # 仅手动触发：在 GitHub Actions 页面点击 "Run workflow" 运行
   workflow_dispatch:
     inputs:
       version:
@@ -117,7 +116,8 @@ jobs:
           VERSION="${{ steps.target_version.outputs.target_version }}"
           FPK_NAME="fnos-${{ env.APP_NAME }}_v${VERSION}.fpk"
           
-          printf '\n*Commit: %s*\n' "${{ github.sha }}" > release_body.md
+          printf '*%s*\n\n' "$VERSION" > release_body.md
+          printf '\n*Commit: %s*\n' "${{ github.sha }}" >> release_body.md
 
           echo "Release notes 已生成"
 
@@ -129,7 +129,7 @@ jobs:
         run: |
           VERSION="${{ steps.target_version.outputs.target_version }}"
           FPK_NAME="fnos-${{ env.APP_NAME }}_v${VERSION}.fpk"
-          RELEASE_TAG="fnos-hermes-agent_v${VERSION}"
+          RELEASE_TAG="v${VERSION}"
           DIST_DIR="dist"
           
           echo "创建 Draft Release: $RELEASE_TAG"
@@ -137,7 +137,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             "$DIST_DIR/$FPK_NAME" \
             --draft \
-            --title "$RELEASE_TAG" \
+            --title "$VERSION" \
             --notes-file release_body.md || exit 1
           
           echo "Draft Release 已创建"
