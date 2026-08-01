@@ -44,8 +44,8 @@ venv:      $TRIM_PKGHOME/data/venv
 hermes:    $TRIM_PKGHOME/data/venv/bin/hermes
 uv:        $TRIM_PKGHOME/data/venv/bin/uv（Python 包管理器，已在 PATH 中）
 Monitor:   Unix socket（$TRIM_APPDEST/hermes-agent.sock），无 TCP 端口
-Gateway:   端口 8642
-Dashboard: 端口 9119
+Gateway:   端口 8642（默认；被占用时启动会自动切换为 28642）
+Dashboard: 端口 9119（默认；被占用时启动会自动切换为 29119）
 数据目录:  $TRIM_PKGVAR（/vol1/@appdata/hermes-agent/）
 ```
 
@@ -56,7 +56,7 @@ Dashboard: 端口 9119
 | 环境变量 | 绝对路径 | 等价路径 | 用途 |
 |----------|----------|----------|------|
 | `$TRIM_PKGHOME` | `/vol1/@apphome/hermes-agent` | `/var/apps/hermes-agent/home` | 持久数据（config、venv、.env、sessions） |
-| `$TRIM_PKGVAR` | `/vol1/@appdata/hermes-agent` | — | 运行时数据（tmp、logs、pid） |
+| `$TRIM_PKGVAR` | `/vol1/@appdata/hermes-agent` | — | 运行时数据（logs、pid、token、chat） |
 | `$TRIM_APPDEST` | `/var/apps/hermes-agent/target` | — | 运行路径（cmd 脚本、socket） |
 
 **`$TRIM_PKGHOME/data/` = `/vol1/@apphome/hermes-agent/data/` = `/var/apps/hermes-agent/home/data/`** — 这三个是**同一个目录**，Hermes 的 .env、config.yaml、weixin/accounts/都在这里。
@@ -109,6 +109,6 @@ sandbox 有 overlay 文件系统，`ls` 可能显示不存在的文件。验证�
 
 遇到具体操作问题时，优先查这些技能：
 
-- **高频操作**：[`hermes-workflows`](../fnos-knowledge/hermes-workflows/SKILL.md) — 前端渲染、微信绑定、进程管理、uv 包管理、验证习惯、文件管理、巡检
+- **高频操作**：[`hermes-workflows`](../fnos-knowledge/hermes-workflows/SKILL.md) — 前端渲染、消息平台接入、进程管理、uv 包管理、验证习惯、文件管理、巡检
 - **系统架构**：[`fnos-sysadmin`](../fnos-knowledge/fnos-sysadmin/SKILL.md) — CLI 命令、网络进阶、安全加固、故障排查、OpenList
 - **开发与 API**：[`fnos-dev-api`](../fnos-knowledge/fnos-dev-api/SKILL.md) — Docker 运维 + fpk 开发 + WS API 完整清单

@@ -1,22 +1,20 @@
 // Hermes Agent 监控服务 — Node.js HTTP 服务（Unix Socket）
-import { serve, file, spawn, WebSocketClient } from "./node-adapter.js";
+import { serve, file, spawn } from "./node-adapter.js";
 import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync, statSync, symlinkSync, watch, chmodSync, readdirSync } from "fs";
 import { randomBytes } from "crypto";
 import { networkInterfaces } from "os";
 import net from "net";
-import { spawnSync } from "child_process";
+import { spawnSync, spawn as spawnAsync } from "child_process";
 import { PROVIDER_PRESETS, PROVIDER_MODELS, PROVIDER_API_KEYS, PROVIDER_CLASSES, PROVIDER_HERMES_IDS } from "./provider-config.js";
-
-// 自定义 provider 环境变量名：剥离 id 中 "custom-" 前缀后规范化大写
-function customEnvKey(id) {
-  const bare = String(id).replace(/^custom-/i, '');
-  return `CUSTOM_${bare.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}_API_KEY`;
-}
-// 兼容旧格式（CUSTOM_PROVIDER_*_API_KEY）用于读取迁移
-function legacyCustomEnvKey(id) {
-  const bare = String(id).replace(/^custom-/i, '');
-  return `CUSTOM_PROVIDER_${bare.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}_API_KEY`;
-}
+import { createCheckpointer, resumeStreamingMessages } from "./chat-hardening.js";
+import { initChannels, handleGetChannels, handleSaveChannel, handleToggleChannel, handleWeixinQr, handleWeixinQrStatus, handleWeixinSave, handleTelegramQr, handleTelegramQrStatus, handleTelegramQrApply, handleWhatsAppQr, handleWhatsAppQrStatus, handleWhatsAppQrApply } from "./channels.js";
+import { toolDisplayName, toolEmoji } from "./tool-names.js";
+import { parseFallback, syncFallbackKeysToHermesEnv } from "./fallback-config.js";
+import { detectApiFormat, probeApiFormat, apiModeForFormat, normalizeApiFormat } from "./api-format.js";
+import { initDashboard, DEFAULT_DASHBOARD_PORT, ALTERNATE_DASHBOARD_PORT, spawnDashboard, handleDashboardStart, handleDashboardStop, checkDashboardHealth, handleDashboardHttp, matchDashboardWsPath, upgradeDashboardWs, handleDashboardWsOpen, handleDashboardWsMessage, handleDashboardWsClose } from "./dashboard.js";
+import { initPrimaryConfig, resolveRealApiKey, loadProvidersState, writeProvidersState, writeConfigYaml, saveProviderKeysToEnv, syncActiveKeyToHermesEnv, cleanupRemovedProviderKeys, resolveBridgePrimary } from "./primary-config.js";
+import { createBridgeKeeper } from "./bridge-keeper.js";
+import { createUpdateChecker } from "./update-check.js";
 
 // 动态检测当前运行路径 - 完全不使用硬编码的盘符或路径
 const ENV_APP_DIR   = process.env.APP_DIR;
@@ -87,10 +85,10 @@ function formatUptime(ms) {
 }
 
 // ─── 端口配置（优先使用环境变量，如有冲突则切换到备选端口）─────────────
+// Dashboard 端口候选常量由 dashboard.js 提供（顶部 import）；下面的
+// gateway/dashboard 联合端口决策属两进程共用逻辑，保留在 monitor.js
 const DEFAULT_GATEWAY_PORT   = 8642;
-const DEFAULT_DASHBOARD_PORT = 9119;
 const ALTERNATE_GATEWAY_PORT = 28642;
-const ALTERNATE_DASHBOARD_PORT = 29119;
 
 let GATEWAY_PORT   = Number(process.env.GATEWAY_PORT);
 let DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT);
@@ -164,9 +162,25 @@ const UPLOAD_DIR    = `${WORKSPACE_DIR}/uploads`;
 const UPLOAD_IMG_DIR = `${WORKSPACE_DIR}/images`;
 const UPLOAD_FILE_DIR = `${WORKSPACE_DIR}/files`;
 const GATEWAY_API   = `http://localhost:${GATEWAY_PORT}/v1`;
-const DASHBOARD_BIND = "127.0.0.1";
 // 向上游发请求时统一使用的浏览器风格 UA，避免 Cloudflare 类网关因缺少 User-Agent 掐断连接
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+// ─── Dashboard 模块接入：注入解析后的端口/路径与共用基础设施 ─────────────
+// log/readPid/stopPid/spawnHermes/findGatewayPid/isPortListening/portAlive
+// 均为本文件的函数声明（作用域提升可见），此处仅传引用，实际调用发生在请求期
+initDashboard({
+  port: DASHBOARD_PORT,
+  gatewayPort: GATEWAY_PORT,
+  basePath: BASE_PATH,
+  pidFile: PID_DASHBOARD,
+  log,
+  readPid,
+  stopPid,
+  spawnHermes,
+  findGatewayPid,
+  isPortListening,
+  portAlive,
+});
 
 // ─── API Key 自动生成（12位随机字母数字）─────────────────────────────────────
 function generateApiKey() {
@@ -185,11 +199,12 @@ try {
   mkdirSync(`${TUI_DIR}/dist`, { recursive: true });
   const tuiEntry = `${TUI_DIR}/dist/entry.js`;
   if (!existsSync(tuiEntry)) {
-    // 动态探测 hermes_cli 的 tui_dist/entry.js（不硬编码 python 版本）
+    // 动态探测 hermes_cli 的 tui_dist/entry.js（不硬编码 python 版本）；
+    // 限 10 秒：此处在服务监听前同步执行，子进程挂起会无限期推迟服务启动
     const pyResult = spawnSync(
       `${VENV_BIN}/python3`,
       ["-c", "import hermes_cli,os;print(os.path.dirname(hermes_cli.__file__))"],
-      { stdout: "pipe", stderr: "pipe" }
+      { stdout: "pipe", stderr: "pipe", timeout: 10000, killSignal: "SIGKILL" }
     );
     const hermesCli = pyResult.stdout?.toString().trim();
     if (hermesCli && existsSync(`${hermesCli}/tui_dist/entry.js`)) {
@@ -212,7 +227,8 @@ function pidAliveSync(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 try {
-  spawnSync("pkill", ["-SIGKILL", "-f", "hermes-agent.*(gateway|dashboard)"]);
+  // 限 10 秒：启动清理在服务监听前同步执行，不允许无限期阻塞
+  spawnSync("pkill", ["-SIGKILL", "-f", "hermes-agent.*(gateway|dashboard)"], { timeout: 10000, killSignal: "SIGKILL" });
 } catch (e) {
   log(`[启动清理] pkill 执行失败: ${e.message}`);
 }
@@ -225,6 +241,40 @@ for (const pidFile of [PID_GATEWAY, PID_DASHBOARD]) {
 }
 try { writeFileSync(LOG_FILE, ""); } catch {}
 
+
+// 异步执行外部命令并带超时强杀：版本探测一类的子进程调用统一走此函数。
+// 同步 spawnSync 会冻结整个事件循环，若子进程挂起（NAS 上 hermes CLI 冷启动或异常时可达分钟级），
+// 期间所有 HTTP 请求（含首屏 index.html、/api/health、/api/status）都无法响应，表现为整页白屏。
+function runCmdAsync(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      // Linux 下以独立进程组启动，超时可整组强杀（覆盖 sh -c 派生的孙进程）
+      child = spawnAsync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+    } catch (e) { resolve({ stdout: "", stderr: "", error: e }); return; }
+    let out = "", err = "", settled = false;
+    let timer = null;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(payload);
+    };
+    timer = setTimeout(() => {
+      // 优先按进程组负 PID 强杀，失败时回退为仅杀直接子进程
+      let killed = false;
+      if (process.platform !== "win32" && child.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); killed = true; } catch {}
+      }
+      if (!killed) { try { child.kill("SIGKILL"); } catch {} }
+      finish({ stdout: out.trim(), stderr: err.trim(), error: new Error(`命令超时（${timeoutMs}ms）已强制终止`) });
+    }, timeoutMs);
+    if (child.stdout) child.stdout.on("data", (d) => { out += d; });
+    if (child.stderr) child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => finish({ stdout: "", stderr: "", error: e }));
+    child.on("close", () => finish({ stdout: out.trim(), stderr: err.trim(), error: null }));
+  });
+}
 
 function formatHermesVersion(raw) {
   if (!raw) return "unknown";
@@ -261,10 +311,12 @@ try {
 if (HERMES_VERSION === "unknown") {
   log(`[版本检测] 尝试从 hermes 二进制获取版本号：${HERMES_BIN_PATH}`);
   
-  // 尝试 1: 标准方式
+  // 尝试 1: 标准方式；限 15 秒：此处在服务监听前同步执行，子进程挂起会无限期推迟服务启动
   const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], { 
     stdout: "pipe", 
-    stderr: "pipe"
+    stderr: "pipe",
+    timeout: 15000,
+    killSignal: "SIGKILL"
   });
   
   let verOut = "";
@@ -313,9 +365,12 @@ if (HERMES_VERSION === "unknown") {
     // 如果是 Python 脚本，直接用 python3 运行
     if (firstLine.includes('python') || firstLine.includes('#!')) {
       log(`[版本检测] 检测到 shebang，使用 Python 运行`);
+      // 限 15 秒：同上，避免备选探测无限期阻塞启动
       const pyResult = spawnSync("python3", [HERMES_BIN_PATH, "--version"], {
         stdout: "pipe",
-        stderr: "pipe"
+        stderr: "pipe",
+        timeout: 15000,
+        killSignal: "SIGKILL"
       });
       
       if (pyResult.stdout) {
@@ -333,12 +388,12 @@ if (HERMES_VERSION === "unknown") {
     log(`[版本检测] hermes --version 所有方式都失败`);
   }
 }
-  // 后台异步刷新版本（解决升级后缓存文件仍是旧版本号的问题）
+  // 后台异步刷新版本（解决升级后缓存文件仍是旧版本号的问题）。
+  // 必须走异步执行：此定时器在服务开始监听后触发，同步子进程一旦挂起会冻结事件循环，
+  // 导致首屏 index.html 等全部请求被拖住直至子进程退出（#141 白屏根因）。
   setTimeout(() => {
-    try {
-      const r = spawnSync(HERMES_BIN_PATH, ["--version"], { stdout: "pipe", stderr: "pipe" });
-      const out = ((r.stdout ? r.stdout.toString() : "").trim())
-               || ((r.stderr ? r.stderr.toString() : "").trim());
+    runCmdAsync(HERMES_BIN_PATH, ["--version"], 15000).then((r) => {
+      const out = r.stdout || r.stderr;
       if (out) {
         const realVer = formatHermesVersion(out);
         if (realVer !== HERMES_VERSION) {
@@ -351,9 +406,9 @@ if (HERMES_VERSION === "unknown") {
       } else if (r.error) {
         log(`[版本检测] 后台刷新执行失败: ${r.error.message}`);
       }
-    } catch (e) {
+    }).catch((e) => {
       log(`[版本检测] 后台刷新异常: ${e.message}`);
-    }
+    });
   }, 3000);
 } catch (e) {
   log(`[版本检测] 版本探测流程异常: ${e.message}`);
@@ -382,6 +437,9 @@ function checkToken(req) {
   const h = req.headers.get("x-monitor-token") || "";
   return h === MONITOR_TOKEN;
 }
+
+// ─── 主模型配置模块接入：注入路径 / 日志 / 本机令牌等共用设施 ───────────
+initPrimaryConfig({ varDir: VAR_DIR, dataDir: DATA_DIR, log, monitorToken: MONITOR_TOKEN });
 
 
 const HERMES_TOKEN_MIRROR = `${DATA_DIR}/.monitor_token`;
@@ -570,17 +628,6 @@ function createSSEParser(onDelta, onDone, onError, onToolEvent) {
   let toolData = {};
   let toolDispatched = false;
 
-  // 将 hermes.tool.progress 的字段名映射为中文显示名
-  const TOOL_NAME_ZH = {
-    execute_code: "执行代码",
-    read_file: "读取文件",
-    search_files: "搜索文件",
-    terminal: "终端命令",
-    web: "网页搜索",
-    delegate_task: "委派任务",
-    session_search: "会话搜索",
-  };
-
   function tryToolEvent() {
     if (currentEvent === "hermes.tool.progress" && toolData.toolCallId && !toolDispatched) {
       toolDispatched = true;
@@ -591,7 +638,8 @@ function createSSEParser(onDelta, onDone, onError, onToolEvent) {
           status: toolData.status,
           emoji: toolData.emoji || "",
           label: toolData.label || "",
-          toolZh: TOOL_NAME_ZH[toolData.tool] || toolData.tool,
+          // 中文显示名与 Agent Bridge 链路共用 tool-names.js 单一映射
+          toolZh: toolDisplayName(toolData.tool),
         });
       }
     }
@@ -773,45 +821,6 @@ async function autoTitle(userMsg, provider) {
   }
 }
 
-function resolveRealApiKey(provider) {
-  if (provider.base_url === "LOCAL" || provider.id === "hermes") {
-    return MONITOR_TOKEN;
-  }
-  if (provider.api_key && !provider.api_key.startsWith("****")) {
-    return provider.api_key;
-  }
-  const envKey = PROVIDER_API_KEYS[provider.id] || PROVIDER_API_KEYS[provider.name] || customEnvKey(provider.id);
-  try {
-    const fromEnv = process.env[envKey];
-    if (fromEnv) return fromEnv;
-    const envProvPath = `${VAR_DIR}/.env.providers`;
-    if (existsSync(envProvPath)) {
-      const provEnv = readFileSync(envProvPath, "utf8");
-      const m = provEnv.match(new RegExp(`^${envKey}=(.*)$`, "m"));
-      if (m && m[1]) return m[1].trim();
-      // 兼容旧名 CUSTOM_PROVIDER_*
-      if (!PROVIDER_API_KEYS[provider.id] && !PROVIDER_API_KEYS[provider.name]) {
-        const legKey = legacyCustomEnvKey(provider.id);
-        const m2 = provEnv.match(new RegExp(`^${legKey}=(.*)$`, "m"));
-        if (m2 && m2[1]) return m2[1].trim();
-      }
-    }
-    // 兜底：DATA_DIR/.env
-    const hermesEnvPath = `${DATA_DIR}/.env`;
-    if (existsSync(hermesEnvPath)) {
-      const hEnv = readFileSync(hermesEnvPath, "utf8");
-      const mh = hEnv.match(new RegExp(`^${envKey}=(.*)$`, "m"));
-      if (mh && mh[1]) return mh[1].trim();
-      if (!PROVIDER_API_KEYS[provider.id] && !PROVIDER_API_KEYS[provider.name]) {
-        const legKey = legacyCustomEnvKey(provider.id);
-        const m2 = hEnv.match(new RegExp(`^${legKey}=(.*)$`, "m"));
-        if (m2 && m2[1]) return m2[1].trim();
-      }
-    }
-    return null;
-  } catch { return null; }
-}
-
 async function chatRequest(provider, message, history, reqSignal) {
   const providerBase = resolveProviderBase(provider);
   const isGateway = providerBase === GATEWAY_API.replace(/\/$/, "");
@@ -852,45 +861,471 @@ async function chatRequest(provider, message, history, reqSignal) {
   return upstream;
 }
 
-// ── 辅助：流式消费 upstream，yield delta ──────────────────────────────────────
-async function* streamDeltas(upstream, decoder, reqSignal) {
-  const reader = upstream.body.getReader();
-  const parser = createSSEParser(
-    (delta) => { /* 内联处理 */ },
-    () => {},
-    () => {},
-  );
+// ─── Agent Bridge IPC 客户端（轮询模式）────────────────────────────
+// 协议约定：与 agent-bridge 服务端（bridge_server.py 的 action 分发）配套的帧格式/action 定义。
+// 帧格式：每个请求建立一条新连接，写入 JSON.stringify(payload) + "\n"，
+//         读取单行 JSON 响应后连接即关闭（一问一答）。
+// 默认 socket 放在本实例私有 VAR_DIR 下（避免 /tmp 全局可写目录被抢占/伪造；
+// VAR_DIR 本身按应用实例隔离，双实例场景 socket 路径天然互不冲突），
+// 仍可用 HERMES_AGENT_BRIDGE_ENDPOINT 环境变量覆盖
+const BRIDGE_ENDPOINT = process.env.HERMES_AGENT_BRIDGE_ENDPOINT || `ipc://${VAR_DIR}/agent-bridge.sock`;
+const BRIDGE_POLL_INTERVAL_MS = 100;        // 轮询间隔，与参考实现 streamOutput 一致
+const BRIDGE_POLL_FAIL_WINDOW_MS = 30000;   // 连续轮询失败超过 30s 才判定失败（替代 2 分钟整体超时）
+const BRIDGE_POLL_RETRY_MS = 500;           // 单次轮询失败后的重试间隔
+const BRIDGE_CHAT_TIMEOUT_MS = 120000;      // chat 请求本身的超时（与参考 DEFAULT_AGENT_BRIDGE_TIMEOUT_MS 一致）
+const BRIDGE_POLL_TIMEOUT_MS = 10000;       // 单次 get_output 请求超时
+const BRIDGE_PING_TIMEOUT_MS = 1500;        // 可用性探测超时
+const BRIDGE_HEALTH_PING_TIMEOUT_MS = 5000; // 保活健康检查专用探活超时（高负载下防误判僵死）
+const PID_BRIDGE = `${VAR_DIR}/bridge.pid`;
+
+// bridge IPC 共享密钥 — monitor 启动时生成随机 token（0600 落盘 VAR_DIR），
+// 每个 IPC 请求 payload 附带 auth 字段，并经 HERMES_BRIDGE_TOKEN env 传给 bridge 进程。
+// 注意：服务端是否校验取决于 hermes_bridge.py 版本（旧版忽略未知字段，不影响通信）；
+// token 读写失败时降级为空（不带 auth），不破坏通信。
+const BRIDGE_TOKEN_FILE = `${VAR_DIR}/bridge.token`;
+const BRIDGE_TOKEN = (() => {
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      parser.feed(chunk);
-      const lines = chunk.split("\n");
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") { return; }
-          try {
-            const json = JSON.parse(data);
-            const delta = json.choices?.[0]?.delta?.content || "";
-            if (delta) yield delta;
-          } catch {}
+    if (existsSync(BRIDGE_TOKEN_FILE)) {
+      const t = readFileSync(BRIDGE_TOKEN_FILE, "utf8").trim();
+      if (t) return t;
+    }
+  } catch {}
+  try {
+    const t = randomBytes(24).toString("hex");
+    writeFileSync(BRIDGE_TOKEN_FILE, t, { mode: 0o600 });
+    return t;
+  } catch { return ""; }
+})();
+
+// 工具徽章的中文显示名/图标映射已抽为外接模块 tool-names.js（单一数据源，
+// bridge IPC 与 SSE 降级两条链路共用；Hermes 升级新增工具时只需维护该文件）
+
+function bridgeConnect(timeoutMs = 0) {
+  return new Promise((resolve, reject) => {
+    let sock;
+    if (BRIDGE_ENDPOINT.startsWith("ipc://")) {
+      sock = net.createConnection(BRIDGE_ENDPOINT.slice("ipc://".length));
+    } else if (BRIDGE_ENDPOINT.startsWith("tcp://")) {
+      const u = new URL(BRIDGE_ENDPOINT);
+      sock = net.createConnection({ host: u.hostname || "127.0.0.1", port: Number(u.port) });
+    } else {
+      reject(new Error(`不支持的 bridge endpoint: ${BRIDGE_ENDPOINT}`));
+      return;
+    }
+    // connect 级超时，防止 endpoint 无响应时无限挂起
+    const timer = timeoutMs > 0
+      ? setTimeout(() => { cleanup(); sock.destroy(); reject(new Error(`Agent Bridge 连接超时 (${timeoutMs}ms)`)); }, timeoutMs)
+      : null;
+    const cleanup = () => { if (timer) clearTimeout(timer); sock.off("connect", onConnect); sock.off("error", onError); };
+    const onConnect = () => { cleanup(); resolve(sock); };
+    const onError = (err) => { cleanup(); sock.destroy(); reject(err); };
+    sock.once("connect", onConnect);
+    sock.once("error", onError);
+  });
+}
+
+async function bridgeRequest(payload, timeoutMs = BRIDGE_CHAT_TIMEOUT_MS) {
+  // timeoutMs 覆盖 connect + 读响应全程（先记 deadline，再发起连接）
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
+  const sock = await bridgeConnect(timeoutMs);
+  // 每个请求附带共享密钥；服务端校验依赖 hermes_bridge.py 版本（忽略未知字段时不影响通信）
+  sock.write(JSON.stringify(BRIDGE_TOKEN ? { ...payload, auth: BRIDGE_TOKEN } : payload) + "\n");
+  const raw = await new Promise((resolve, reject) => {
+    // 按字节累积 Buffer，找 0x0A 分行后整体 decode，避免 UTF-8 多字节字符跨包乱码
+    const buffers = [];
+    const readTimeoutMs = deadline ? Math.max(1, deadline - Date.now()) : 0;
+    const timer = readTimeoutMs > 0
+      ? setTimeout(() => { cleanup(); sock.destroy(); reject(new Error(`Agent Bridge 请求超时 (${timeoutMs}ms)`)); }, readTimeoutMs)
+      : null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      sock.off("data", onData); sock.off("error", onError);
+      sock.off("end", onEnd); sock.off("close", onClose);
+    };
+    // cleanup 摘除监听后补一个 no-op error 监听，防对端 RST 抛 uncaughtException
+    const finish = (line) => { cleanup(); sock.on("error", () => {}); sock.end(); resolve(line); };
+    const bufferedLine = () => {
+      const all = Buffer.concat(buffers);
+      const idx = all.indexOf(0x0a);
+      return (idx >= 0 ? all.subarray(0, idx) : all).toString("utf8").trim();
+    };
+    const onData = (chunk) => {
+      buffers.push(chunk);
+      if (chunk.includes(0x0a)) finish(bufferedLine());
+    };
+    const onError = (err) => { cleanup(); sock.destroy(); reject(err); };
+    const onEnd = () => { const line = bufferedLine(); if (line) finish(line); };
+    // close 时若仍有未换行残留（对端异常断开），按一行处理而不是挂起等超时
+    const onClose = () => {
+      const line = bufferedLine();
+      if (line) finish(line);
+      else { cleanup(); reject(new Error("Agent Bridge socket 关闭且无响应")); }
+    };
+    sock.on("data", onData);
+    sock.once("error", onError);
+    sock.once("end", onEnd);
+    sock.once("close", onClose);
+  });
+  const resp = JSON.parse(raw);
+  if (!resp.ok) {
+    const err = new Error(resp.error || "Agent Bridge 请求失败");
+    err.response = resp;
+    throw err;
+  }
+  return resp;
+}
+
+async function bridgeAvailable() {
+  try { await bridgeRequest({ action: "ping" }, BRIDGE_PING_TIMEOUT_MS); bridgeUnavailableLoggedAt = 0; return true; }
+  catch (e) {
+    // 限频记录：同一持续不可用期 5 分钟内只记一条，恢复后重置
+    if (Date.now() - bridgeUnavailableLoggedAt > 300000) {
+      bridgeUnavailableLoggedAt = Date.now();
+      log(`[bridge] bridge 不可用，本次对话降级 HTTP SSE: ${e?.message || e}`);
+    }
+    return false;
+  }
+}
+let bridgeUnavailableLoggedAt = 0; // 上次记录 bridge 不可用日志的时间戳（防刷屏）
+
+// 发起对话 → {ok, run_id, session_id, status}
+// runtime（可选 {model, provider}）：面板主模型，随请求透传给 bridge（请求字段
+// 优先于 config.yaml 默认）；缺省不传，bridge 回落默认模型，旧版 bridge 忽略未知字段
+function bridgeChat(sessionId, message, history, instructions, runtime) {
+  return bridgeRequest({
+    action: "chat",
+    session_id: sessionId,
+    message,
+    ...(history && history.length ? { conversation_history: history } : {}),
+    ...(instructions ? { instructions } : {}),
+    ...(runtime && runtime.model ? { model: runtime.model } : {}),
+    ...(runtime && runtime.provider ? { provider: runtime.provider } : {}),
+  }, BRIDGE_CHAT_TIMEOUT_MS);
+}
+
+// 轮询输出 → {ok, delta, cursor, output, done, status, error, events, event_cursor}
+function bridgeGetOutput(runId, cursor, eventCursor) {
+  return bridgeRequest({
+    action: "get_output",
+    run_id: runId,
+    cursor,
+    event_cursor: eventCursor,
+  }, BRIDGE_POLL_TIMEOUT_MS);
+}
+
+// 用户中断（fire-and-forget）
+function bridgeInterrupt(sessionId) {
+  return bridgeRequest({ action: "interrupt", session_id: sessionId }, 5000).catch(() => {});
+}
+
+// 将 bridge 的 tool.started / tool.completed 事件映射为前端 tool_progress 结构，
+// 字段与现有 hermes.tool.progress 转发格式一致：{tool, toolCallId, status, emoji, label, toolZh}
+function mapBridgeToolEvent(ev) {
+  const tool = String(ev.tool_name || "");
+  return {
+    tool,
+    toolCallId: String(ev.tool_call_id || "") || `bridge-${tool}`,
+    status: ev.event === "tool.completed" ? "completed" : "running",
+    emoji: toolEmoji(tool),
+    label: "",
+    toolZh: toolDisplayName(tool),
+  };
+}
+
+// Bridge 轮询主循环：返回 {fullReply, hadToolCalls, aborted}
+// 失败时抛错；若错误发生前已向前端输出过内容，err.bridgeEmitted=true（调用方不得降级重放）
+async function runBridgeChat({ sessionId, message, history, instructions, signal, onDelta, onTool }) {
+  // 网页对话与网关/微信链路对齐：解析面板主模型随请求传入；
+  // 解析失败/LOCAL 时为 null（不传字段，维持 bridge 默认模型行为），不阻断对话
+  let primaryRuntime = null;
+  try { primaryRuntime = resolveBridgePrimary(getActiveProvider()); } catch {}
+  const started = await bridgeChat(sessionId, message, history, instructions, primaryRuntime);
+  const runId = started.run_id;
+  let cursor = 0;
+  let eventCursor = 0;
+  let fullReply = "";
+  let hadToolCalls = false;
+  let lastPollOkAt = Date.now();
+
+  const fail = (msg) => {
+    const err = new Error(msg);
+    err.bridgeEmitted = fullReply.length > 0 || hadToolCalls;
+    err.partial = fullReply;
+    throw err;
+  };
+
+  // 错误文案归一：非字符串时取 .message 或 JSON 序列化，避免 "[object Object]"
+  const asErrText = (e, dflt) => {
+    if (typeof e === "string" && e.trim()) return e;
+    if (e && typeof e === "object") {
+      if (typeof e.message === "string" && e.message.trim()) return e.message;
+      try { const s = JSON.stringify(e); if (s && s !== "{}") return s; } catch {}
+    }
+    return dflt;
+  };
+
+  for (;;) {
+    if (signal && signal.aborted) {
+      bridgeInterrupt(sessionId);
+      return { fullReply, hadToolCalls, aborted: true };
+    }
+    let chunk;
+    try {
+      chunk = await bridgeGetOutput(runId, cursor, eventCursor);
+      lastPollOkAt = Date.now();
+    } catch (e) {
+      // 错误分类——bridge 进程已死（unix socket ENOENT/ECONNREFUSED）或协议级
+      // 错误（resp.ok=false，e.response 存在，如 unknown run_id）立即失败；
+      // 仅网络瞬断类错误走 30s 重试窗口
+      const _code = e && e.code;
+      const _procDead = _code === "ENOENT" || _code === "ECONNREFUSED";
+      const _protocolErr = !!(e && e.response);
+      if (_procDead || _protocolErr) {
+        fail(`Agent Bridge ${_protocolErr ? "协议错误" : "进程不可达"}: ${e.message || e}`);
+      }
+      // 轮询模式下不设整体超时：连续失败超过窗口才判定失败
+      if (Date.now() - lastPollOkAt > BRIDGE_POLL_FAIL_WINDOW_MS) {
+        fail(`Agent Bridge 轮询连续失败超过 ${Math.round(BRIDGE_POLL_FAIL_WINDOW_MS / 1000)}s: ${e.message || e}`);
+      }
+      await new Promise(r => setTimeout(r, BRIDGE_POLL_RETRY_MS));
+      continue;
+    }
+    cursor = chunk.cursor ?? cursor;
+    eventCursor = chunk.event_cursor ?? eventCursor;
+
+    // 参考 applyBridgeChunkAsync：events 里出现 stream.delta（与工具事件按真实顺序
+    // 交错）时按事件顺序消费文本，此时不能再消费聚合的 chunk.delta（会重复）
+    let sawStreamDeltaEvent = false;
+    for (const ev of chunk.events || []) {
+      const evType = ev && ev.event;
+      if (evType === "stream.delta") {
+        // 仅在实际消费到非空 delta 文本时才屏蔽聚合 chunk.delta，
+        // 避免空 stream.delta 事件误丢本轮聚合文本
+        const text = String(ev.delta || "");
+        if (text) { sawStreamDeltaEvent = true; fullReply += text; if (onDelta) onDelta(text); }
+      } else if (evType === "message.interim") {
+        // 中间轮 assistant 文本（不经流式通道）：already_streamed=false 时作为 delta
+        // 下发；true 表示流式已推过，跳过防重复。interim 文本不在聚合 chunk.delta
+        // 中，故不置 sawStreamDeltaEvent（否则会误丢本轮聚合文本）。
+        // 护栏：旧引擎可能不带 already_streamed（缺省 false）但文本已走过流式
+        // 回调；fullReply 或本轮尚未消费的聚合 chunk.delta 已包含该文本时
+        // 跳过防重复（事件先于聚合 delta 处理，需两处都查）
+        if (!ev.already_streamed) {
+          const text = String(ev.text || "");
+          if (text && !fullReply.includes(text) && !String(chunk.delta || "").includes(text)) {
+            fullReply += text; if (onDelta) onDelta(text);
+          }
         }
+      } else if (evType === "tool.started" || evType === "tool.completed") {
+        hadToolCalls = true;
+        if (onTool) onTool(mapBridgeToolEvent(ev));
       }
     }
-  } catch (e) {
-    if (e.name !== "AbortError") throw e;
-  } finally {
-    parser.flush();
-    reader.releaseLock();
+    if (!sawStreamDeltaEvent && chunk.delta) {
+      const text = String(chunk.delta);
+      fullReply += text;
+      if (onDelta) onDelta(text);
+    }
+
+    if (chunk.done) {
+      if (chunk.status === "error") {
+        fail(String(chunk.error || "Agent Bridge run 失败"));
+      }
+      const res = (chunk.result && typeof chunk.result === "object") ? chunk.result : {};
+      const interrupted = chunk.status === "interrupted";
+      // 候选最终文本：聚合 output 优先；trim 后为空时回退 result 里的整段回复
+      //（final_response → response → output 逐层取第一个非空字符串；非 string
+      //  跳过，防 "[object Object]" 下发；与 Python 侧 or 链语义对齐）
+      let candidate = chunk.output != null ? String(chunk.output) : "";
+      if (!candidate.trim()) {
+        candidate = "";
+        for (const v of [res.final_response, res.response, res.output]) {
+          if (typeof v === "string" && v.trim()) { candidate = v; break; }
+        }
+      }
+      // 引擎报告失败（用户主动中断优先，不当失败处理）：无可用内容时按
+      // error 收尾透传真实错误；有内容时保留内容下发，仅在末尾附加警示
+      const hasContent = !!(candidate || fullReply);
+      if (!interrupted && res.failed && !hasContent) {
+        fail(asErrText(res.error, "bridge 任务失败"));
+      }
+      // 包含性补发：candidate 未被 fullReply 完整包含时——前缀关系按差额
+      // tail 补发（闭合丢文本窗口）；否则以空行分隔追加整段下发，避免
+      // interim 计入 fullReply 导致前缀失配时静默丢最终回复；
+      // 已完整包含则不动作，防重复
+      if (candidate && !fullReply.includes(candidate)) {
+        if (candidate.startsWith(fullReply)) {
+          const tail = candidate.slice(fullReply.length);
+          fullReply = candidate;
+          if (onDelta) onDelta(tail);
+        } else {
+          const sep = fullReply ? "\n\n" : "";
+          fullReply += sep + candidate;
+          if (onDelta) onDelta(sep + candidate);
+        }
+      }
+      if (!interrupted && res.failed && hasContent) {
+        const warn = "\n\n⚠️ 本次回复未完全成功，内容可能不完整";
+        fullReply += warn;
+        if (onDelta) onDelta(warn);
+      }
+      return { fullReply, hadToolCalls, aborted: interrupted };
+    }
+    await new Promise(r => setTimeout(r, BRIDGE_POLL_INTERVAL_MS));
   }
 }
 
+// ─── Agent Bridge 进程管理 ──────────────────────────────────────────────
+// 启动命令：<python> hermes_bridge.py --endpoint <ep> [--agent-root ..] [--hermes-home ..]
+// bridge 脚本按候选路径探测；找不到则跳过（依赖降级路径）
+function findBridgeScript() {
+  const candidates = [
+    process.env.HERMES_BRIDGE_SCRIPT || "",
+    `${APP_DIR}/server/vendor/agent-bridge/hermes_bridge.py`,
+    `${DATA_DIR}/agent-bridge/hermes_bridge.py`,
+  ].filter(Boolean);
+  return candidates.find(p => { try { return existsSync(p); } catch { return false; } }) || null;
+}
 
-const PROVIDER_TIMEOUT_MS = 120000;
+// 模块级启动锁，防止 /api/start 与 /api/restart 并发触发时重复 spawn
+let bridgeStartLock = false;
+// bridge 保活器实例（在 manualStopEpoch 声明后初始化，见 initChannels 之后）
+let bridgeKeeper = null;
+
+function startAgentBridge() {
+  if (bridgeStartLock) return { ok: true, msg: "start_in_progress" };
+  bridgeStartLock = true;
+  try {
+    if (readBridgePid()) return { ok: true, msg: "already_running" };
+    const script = findBridgeScript();
+    if (!script) {
+      log("[bridge] 未找到 hermes_bridge.py（候选：HERMES_BRIDGE_SCRIPT / server/vendor/agent-bridge / data/agent-bridge），跳过启动，对话将降级为 HTTP SSE");
+      return { ok: false, error: "script_not_found" };
+    }
+    const python = existsSync(`${VENV_BIN}/python3`) ? `${VENV_BIN}/python3`
+      : (existsSync(`${VENV_BIN}/python`) ? `${VENV_BIN}/python` : "python3");
+    const logPath = `${VAR_DIR}/bridge.log`;
+    // 追加写保留崩溃历史；超限时保留尾部 256KB，启动时写入带时间戳分隔行
+    try {
+      let prev = "";
+      try { if (existsSync(logPath) && statSync(logPath).size <= 8388608) prev = readFileSync(logPath, "utf8"); } catch {}
+      if (prev.length > 262144) prev = prev.slice(-262144);
+      writeFileSync(logPath, prev + `\n===== bridge start ${new Date().toISOString()} =====\n`);
+    } catch {}
+    // node-adapter 的对象式 spawn 不透传 detached/进程组选项（仅接受
+    // cmd/env/stdout/stderr/stdin），无法以独立进程组启动后按 -pgid 杀组；
+    // 停止侧由 stopAgentBridge() 对 hermes_bridge.py 命令行匹配补杀
+    const p = spawn({
+      cmd: [python, script, "--endpoint", BRIDGE_ENDPOINT, "--hermes-home", DATA_DIR],
+      env: {
+        ...process.env,
+        HOME: DATA_DIR,
+        HERMES_HOME: DATA_DIR,
+        HERMES_AGENT_BRIDGE_ENDPOINT: BRIDGE_ENDPOINT,
+        // 共享密钥经 env 传给 bridge（服务端校验依赖 hermes_bridge.py 版本）
+        ...(BRIDGE_TOKEN ? { HERMES_BRIDGE_TOKEN: BRIDGE_TOKEN } : {}),
+        HERMES_YOLO_MODE: "1",
+        // PATH 与 spawnHermes 对齐（注入 resolvedNodeDir / HERMES_NODE）
+        PATH: resolvedNodeDir
+          ? `${resolvedNodeDir}:${VENV_BIN}:/usr/local/bin:/usr/bin:/bin`
+          : `${VENV_BIN}:/usr/local/bin:/usr/bin:/bin`,
+        ...(resolvedNodeBin ? { HERMES_NODE: resolvedNodeBin } : {}),
+      },
+      stdout: file(logPath),
+      stderr: file(logPath),
+      stdin: "ignore",
+    });
+    // spawn 异步失败（如可执行文件不存在）时 pid 无效：按启动失败返回，不写 PID、不挂保活
+    if (!Number.isInteger(p.pid) || p.pid <= 0) {
+      log("[bridge] Agent Bridge 启动失败：spawn 未返回有效 pid");
+      return { ok: false, error: "spawn_no_pid" };
+    }
+    p.unref();
+    writeFileSync(PID_BRIDGE, String(p.pid));
+    if (bridgeKeeper) bridgeKeeper.watch(p, p.pid); // 保活：登记进程并挂退出监听
+    log(`[bridge] Agent Bridge 已启动 pid=${p.pid} endpoint=${BRIDGE_ENDPOINT}`);
+    return { ok: true, pid: p.pid };
+  } catch (e) {
+    // 失败容忍：仅记录日志，对话自动降级为 HTTP SSE
+    log(`[bridge] Agent Bridge 启动失败（将降级为 HTTP SSE）: ${e.message || e}`);
+    return { ok: false, error: e.message || String(e) };
+  } finally {
+    bridgeStartLock = false;
+  }
+}
+
+// ── 辅助：对话流式公共参数 ──────────────────────────────────────
+const PROVIDER_TIMEOUT_MS = 300000; // 流式不活动超时：连接或相邻数据块之间超过该时长无数据才中断
 const activeChatStreams = new Map();
 const wsMessageQueue = new Map(); // session_id → message，WS 连接前暂存
+
+// ─── 多会话并发运行表（任务 #8）─────────────────────────────────────────
+// session_id → 运行态条目。对话运行期间实时更新；结束后保留 TTL 供前端
+// 切回窗口时拉取最终态，超时由周期性扫描清理。
+// 覆盖 Agent Bridge 与 HTTP SSE 降级两条链路（均在调用方回调处挂钩）。
+const LIVE_RUN_TTL_MS = 10 * 60 * 1000;      // 结束后保留 10 分钟
+const LIVE_RUN_OUTPUT_CAP = 2 * 1024 * 1024; // 单会话输出缓存上限（字符），超出后丢头保尾
+const LIVE_RUN_TOOL_CAP = 500;               // 单会话工具事件缓存上限
+const liveRuns = new Map();
+
+// 新建运行条目，返回 monitor 级 run_id（与 bridge 内部 run_id 无关）。
+// 同 session 新运行接管时直接覆盖旧条目；旧运行的后续回调因 run_id 不匹配而被忽略
+function liveRunStart(sessionId) {
+  const runId = randomBytes(8).toString("hex");
+  liveRuns.set(sessionId, {
+    run_id: runId,
+    status: "running",       // running | complete | interrupted | error
+    output: "",
+    output_base: 0,          // 被丢弃的头部字符数（绝对游标 = output_base + output.length）
+    tool_events: [],
+    tool_base: 0,            // 被丢弃的头部事件数
+    started_at: Date.now(),
+    updated_at: Date.now(),
+    done: false,
+  });
+  return runId;
+}
+function liveRunEntry(sessionId, runId) {
+  const e = liveRuns.get(sessionId);
+  return e && e.run_id === runId ? e : null;
+}
+function liveRunDelta(sessionId, runId, text) {
+  const e = liveRunEntry(sessionId, runId);
+  if (!e || !text) return;
+  e.output += text;
+  if (e.output.length > LIVE_RUN_OUTPUT_CAP) {
+    const drop = e.output.length - LIVE_RUN_OUTPUT_CAP;
+    e.output = e.output.slice(drop);
+    e.output_base += drop;
+  }
+  e.updated_at = Date.now();
+}
+function liveRunTool(sessionId, runId, toolEvent) {
+  const e = liveRunEntry(sessionId, runId);
+  if (!e) return;
+  e.tool_events.push(toolEvent);
+  if (e.tool_events.length > LIVE_RUN_TOOL_CAP) {
+    const drop = e.tool_events.length - LIVE_RUN_TOOL_CAP;
+    e.tool_events.splice(0, drop);
+    e.tool_base += drop;
+  }
+  e.updated_at = Date.now();
+}
+function liveRunEnd(sessionId, runId, status) {
+  const e = liveRunEntry(sessionId, runId);
+  if (!e || e.done) return;
+  e.status = status;
+  e.done = true;
+  e.updated_at = Date.now();
+}
+// 周期性清理：已结束且超过 TTL 的条目
+const liveRunSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [sid, e] of liveRuns) {
+    if (e.done && now - e.updated_at > LIVE_RUN_TTL_MS) liveRuns.delete(sid);
+  }
+}, 60000);
+if (liveRunSweeper.unref) liveRunSweeper.unref();
 
 function combineSignals(signals) {
   const valid = signals.filter(Boolean);
@@ -930,7 +1365,13 @@ function createChatStream(sessionId, message, reqSignal) {
       const decoder = new TextDecoder();
 
       const stopCtrl = new AbortController();
+      // 同一 session 串行：若该会话已有运行中对话，先中断旧运行（新请求接管，
+      // 与既有 WS→XHR 回退行为一致）；不同 session 互不影响，可并发运行
+      const prevCtrl = activeChatStreams.get(sessionId);
+      if (prevCtrl && prevCtrl !== stopCtrl) { try { prevCtrl.abort(); } catch {} }
       activeChatStreams.set(sessionId, stopCtrl);
+      let liveRunId = null; // 运行表条目 id（session 校验通过后登记）
+      let ckpt = null;       // checkpoint 实例（session 加载后创建）
 
       const keepaliveTimer = setInterval(() => {
         try { controller.enqueue(enc.encode(`: keepalive\n\n`)); } catch {}
@@ -947,13 +1388,20 @@ function createChatStream(sessionId, message, reqSignal) {
           sendJSON({ error: "session not found" }); send("[DONE]", "end"); cleanup(); controller.close(); return;
         }
 
+        // 登记并发运行表（覆盖 bridge 与 HTTP SSE 降级两条链路）
+        liveRunId = liveRunStart(sessionId);
+
         // 去重：WS 路径（runChatWS）可能在 XHR 回退前已推送过该用户消息
         const _lastMsg = session.messages[session.messages.length - 1];
         const _isSameUserMsg = _lastMsg && _lastMsg.role === "user" &&
           JSON.stringify(_lastMsg.content) === JSON.stringify(message);
         if (!_isSameUserMsg) {
           session.messages.push({ role: "user", content: message, ts: Date.now() });
+          saveSession(session);
         }
+
+        // 聊天加固：流式回复增量 checkpoint（周期持久化半成品，崩溃不丢内容）
+        ckpt = createCheckpointer(sessionId, session, { saveSession, log });
 
         const MAX_HISTORY = 50;
         const rawHistory = session.messages.slice(-MAX_HISTORY).map(m => ({ role: m.role, content: m.content }));
@@ -971,8 +1419,43 @@ function createChatStream(sessionId, message, reqSignal) {
 
         let fullReply = "";
         let requestError = null;
+        let hadToolCalls = false;
+        let bridgeHandled = false;
+        let bridgeAborted = false;
 
-        for (let i = 0; i < allProviders.length; i++) {
+        // ── 优先路径：Agent Bridge IPC 轮询（多轮工具调用内容可靠回传）──
+        // Bridge 不可用/未输出前失败时，自动降级到下方原有 HTTP SSE 路径
+        if (await bridgeAvailable()) {
+          try {
+            const r = await runBridgeChat({
+              sessionId,
+              message,
+              history: rawHistory.slice(0, -1),
+              instructions: UI_CAPABILITIES_PROMPT,
+              signal: stopCtrl.signal,
+              onDelta: (delta) => { sendJSON({ delta }); liveRunDelta(sessionId, liveRunId, delta); ckpt.onDelta(delta); },
+              onTool: (toolEvent) => { sendJSON({ tool_progress: toolEvent }); liveRunTool(sessionId, liveRunId, toolEvent); },
+            });
+            fullReply = r.fullReply;
+            hadToolCalls = r.hadToolCalls;
+            bridgeAborted = !!r.aborted;
+            bridgeHandled = true;
+          } catch (e) {
+            if (e && e.bridgeEmitted) {
+              // 已向前端输出过内容，不能降级重放，直接按错误收尾（保存部分回复）
+              sendJSON({ error: e.message || String(e) });
+              liveRunEnd(sessionId, liveRunId, "error");
+              ckpt.finalize(e.partial || undefined);
+              send("[DONE]", "end");
+              cleanup();
+              try { controller.close(); } catch {}
+              return;
+            }
+            log(`Agent Bridge 对话失败，降级到 HTTP SSE: ${(e && e.message) || e}`);
+          }
+        }
+
+        for (let i = 0; !bridgeHandled && i < allProviders.length; i++) {
           const provider = allProviders[i];
           const isFallback = i > 0;
           if (isFallback) {
@@ -981,19 +1464,21 @@ function createChatStream(sessionId, message, reqSignal) {
 
           try {
  
+            // 不活动超时：每次收到数据重置计时，覆盖连接与流式读取全程
             const timeoutController = new AbortController();
-            const timeoutTimer = setTimeout(() => timeoutController.abort(), PROVIDER_TIMEOUT_MS);
+            let timeoutTimer = setTimeout(() => timeoutController.abort(), PROVIDER_TIMEOUT_MS);
+            const resetIdleTimeout = () => { clearTimeout(timeoutTimer); timeoutTimer = setTimeout(() => timeoutController.abort(), PROVIDER_TIMEOUT_MS); };
             const signal = combineSignals([timeoutController.signal, stopCtrl.signal]);
 
             const upstream = await chatRequest(provider, message, history, signal);
-            clearTimeout(timeoutTimer);
+            resetIdleTimeout();
 
-            let hadToolCalls = false;
+            hadToolCalls = false;
             const localParser = createSSEParser(
-              (delta) => { fullReply += delta; sendJSON({ delta }); },
+              (delta) => { fullReply += delta; sendJSON({ delta }); liveRunDelta(sessionId, liveRunId, delta); ckpt.onDelta(delta); },
               () => {},
               (err) => { requestError = err; sendJSON({ error: err }); },
-              (toolEvent) => { hadToolCalls = true; sendJSON({ tool_progress: toolEvent }); },
+              (toolEvent) => { hadToolCalls = true; sendJSON({ tool_progress: toolEvent }); liveRunTool(sessionId, liveRunId, toolEvent); },
             );
 
             const reader = upstream.body.getReader();
@@ -1002,11 +1487,17 @@ function createChatStream(sessionId, message, reqSignal) {
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                resetIdleTimeout();
                 localParser.feed(localDecoder.decode(value, { stream: true }));
               }
             } catch (e) {
               if (e.name !== "AbortError") throw e;
+              // 不活动超时中断：提示仅发前端展示，不并入 fullReply（不进存档与下一轮上下文）
+              if (fullReply && timeoutController.signal.aborted && !stopCtrl.signal.aborted) {
+                sendJSON({ delta: "\n\n（回复因超时中断）" });
+              }
             } finally {
+              clearTimeout(timeoutTimer);
               localParser.flush();
               reader.releaseLock();
             }
@@ -1023,25 +1514,20 @@ function createChatStream(sessionId, message, reqSignal) {
         }
         if (requestError !== null) {
           sendJSON({ error: `所有模型均失败: ${requestError}` });
+          liveRunEnd(sessionId, liveRunId, "error");
+          ckpt.finalize(); // 保存已收到的部分内容（若有）
           send("[DONE]", "end");
           cleanup();
           controller.close();
           return;
         }
 
-        // 替换最近的 WS 助手消息（来自 WS→XHR 回退），使会话反映用户实际看到的内容
-        //（即 XHR 响应），而非不完整的 WS 响应。
-        const _assistantContent = fullReply || (hadToolCalls ? "（已执行工具，未生成文字回复）" : "（Gateway 连接失败）");
-        const _lastForReplace = session.messages[session.messages.length - 1];
-        if (_lastForReplace && _lastForReplace.role === "assistant" && (Date.now() - _lastForReplace.ts) < 60000) {
-          _lastForReplace.content = _assistantContent;
-          _lastForReplace.ts = Date.now();
-        } else {
-          session.messages.push({ role: "assistant", content: _assistantContent, ts: Date.now() });
-        }
-        saveSession(session);
+        // 流式回复完成：通过 checkpoint finalize 转正流式消息（含 WS→XHR 回退去重逻辑）
+        const _assistantContent = fullReply || (hadToolCalls ? "（已执行工具，未生成文字回复）" : (bridgeHandled ? "（已执行完成，未生成文字回复）" : "（Gateway 连接失败）"));
+        ckpt.finalize(_assistantContent);
 
-        if (session.title === "New Chat" && session.messages.length >= 2) {
+        // 用户中断（bridge aborted）时跳过自动标题，按中断收尾
+        if (!bridgeAborted && session.title === "New Chat" && session.messages.length >= 2) {
           autoTitle(message, primary).then(title => {
             const s2 = getSession(sessionId);
             if (s2 && s2.title === "New Chat") {
@@ -1052,9 +1538,12 @@ function createChatStream(sessionId, message, reqSignal) {
         }
 
         send("[DONE]", "end");
+        liveRunEnd(sessionId, liveRunId, bridgeAborted ? "interrupted" : "complete");
       } catch (e) {
         sendJSON({ error: e.message });
         send("[DONE]", "end");
+        if (liveRunId) liveRunEnd(sessionId, liveRunId, "error");
+        if (ckpt) ckpt.dispose();
       }
       cleanup();
       try { controller.close(); } catch {}
@@ -1067,12 +1556,19 @@ function createChatStream(sessionId, message, reqSignal) {
 const wsClients = new Map(); // session_id → ws
 
 async function runChatWS(ws, sessionId, message) {
-  const sendJSON = (obj) => { try { ws.send(JSON.stringify(obj)); } catch {} };
+  // 多会话并发：WS 下行消息全部附带 session_id 字段（仅新增字段，
+  // 不改变既有字段，旧前端忽略未知字段即可正常工作）
+  const sendJSON = (obj) => { try { ws.send(JSON.stringify({ ...obj, session_id: sessionId })); } catch {} };
 
   const stopCtrl = new AbortController();
   ws.data.stopCtrl = stopCtrl;
+  // 同一 session 串行：若该会话已有运行中对话，先中断旧运行（新请求接管）；
+  // 不同 session 互不影响，可并发运行
+  const prevCtrl = activeChatStreams.get(sessionId);
+  if (prevCtrl && prevCtrl !== stopCtrl) { try { prevCtrl.abort(); } catch {} }
   activeChatStreams.set(sessionId, stopCtrl);
   wsClients.set(sessionId, ws);
+  let liveRunId = null; // 并发运行表条目 id（session 校验通过后登记）
   sendJSON({ info: '正在思考…' });
 
   const pingTimer = setInterval(() => { try { ws.ping(); } catch {} }, 30000);
@@ -1086,9 +1582,13 @@ async function runChatWS(ws, sessionId, message) {
   };
 
   let session = null;
+  let ckpt = null; // checkpoint 实例（session 加载后创建）
   try {
     session = getSession(sessionId);
     if (!session) { sendJSON({ error: "session not found" }); sendJSON({ done: true }); cleanup(); return; }
+
+    // 登记并发运行表（覆盖 bridge 与 HTTP SSE 降级两条链路）
+    liveRunId = liveRunStart(sessionId);
 
     // 去重：防止边界情况（如并发调用）下出现重复用户消息
     const _wsLastMsg = session.messages[session.messages.length - 1];
@@ -1096,7 +1596,11 @@ async function runChatWS(ws, sessionId, message) {
       JSON.stringify(_wsLastMsg.content) === JSON.stringify(message);
     if (!_wsIsSameMsg) {
       session.messages.push({ role: "user", content: message, ts: Date.now() });
+      saveSession(session);
     }
+
+    // 聊天加固：流式回复增量 checkpoint
+    ckpt = createCheckpointer(sessionId, session, { saveSession, log });
 
     const MAX_HISTORY = 50;
     const rawHistory = session.messages.slice(-MAX_HISTORY).map(m => ({ role: m.role, content: m.content }));
@@ -1115,26 +1619,61 @@ async function runChatWS(ws, sessionId, message) {
     let fullReply = "";
     let requestError = null;
     let hadToolCalls = false;
+    let bridgeHandled = false;
+    let bridgeAborted = false;
 
-    for (let i = 0; i < allProviders.length; i++) {
+    // ── 优先路径：Agent Bridge IPC 轮询（多轮工具调用内容可靠回传）──
+    // Bridge 不可用/未输出前失败时，自动降级到下方原有 HTTP SSE 路径
+    if (await bridgeAvailable()) {
+      try {
+        const r = await runBridgeChat({
+          sessionId,
+          message,
+          history: rawHistory.slice(0, -1),
+          instructions: UI_CAPABILITIES_PROMPT,
+          signal: stopCtrl.signal,
+          onDelta: (delta) => { sendJSON({ delta }); liveRunDelta(sessionId, liveRunId, delta); ckpt.onDelta(delta); },
+          onTool: (toolEvent) => { sendJSON({ tool_progress: toolEvent }); liveRunTool(sessionId, liveRunId, toolEvent); },
+        });
+        fullReply = r.fullReply;
+        hadToolCalls = r.hadToolCalls;
+        bridgeAborted = !!r.aborted;
+        bridgeHandled = true;
+      } catch (e) {
+        if (e && e.bridgeEmitted) {
+          // 已向前端输出过内容，不能降级重放，直接按错误收尾（保存部分回复）
+          sendJSON({ error: e.message || String(e) });
+          liveRunEnd(sessionId, liveRunId, "error");
+          ckpt.finalize(e.partial || undefined);
+          sendJSON({ done: true });
+          cleanup();
+          return;
+        }
+        log(`Agent Bridge 对话失败，降级到 HTTP SSE: ${(e && e.message) || e}`);
+      }
+    }
+
+    for (let i = 0; !bridgeHandled && i < allProviders.length; i++) {
       const provider = allProviders[i];
       const isFallback = i > 0;
       if (isFallback) sendJSON({ info: `主模型超时，切换备选: ${provider.name}...` });
 
       try {
         hadToolCalls = false;
+        // 不活动超时：每次收到数据重置计时，覆盖连接与流式读取全程（与 SSE 链路对称）
         const timeoutController = new AbortController();
-        const timeoutTimer = setTimeout(() => timeoutController.abort(), PROVIDER_TIMEOUT_MS);
+        let timeoutTimer = setTimeout(() => timeoutController.abort(), PROVIDER_TIMEOUT_MS);
+        const resetIdleTimeout = () => { clearTimeout(timeoutTimer); timeoutTimer = setTimeout(() => timeoutController.abort(), PROVIDER_TIMEOUT_MS); };
         const signal = combineSignals([timeoutController.signal, stopCtrl.signal]);
 
         const upstream = await chatRequest(provider, message, history, signal);
-        clearTimeout(timeoutTimer);
+        resetIdleTimeout();
 
         const localParser = createSSEParser(
-          (delta) => { fullReply += delta; sendJSON({ delta }); },
+          (delta) => { fullReply += delta; sendJSON({ delta }); liveRunDelta(sessionId, liveRunId, delta); ckpt.onDelta(delta); },
           () => {},
           (err) => { requestError = err; sendJSON({ error: err }); },
-          (toolEvent) => { hadToolCalls = true; sendJSON({ tool_progress: toolEvent }); },
+          (toolEvent) => { hadToolCalls = true; sendJSON({ tool_progress: toolEvent }); liveRunTool(sessionId, liveRunId, toolEvent); },
         );
 
         const reader = upstream.body.getReader();
@@ -1143,11 +1682,17 @@ async function runChatWS(ws, sessionId, message) {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            resetIdleTimeout();
             localParser.feed(localDecoder.decode(value, { stream: true }));
           }
         } catch (e) {
           if (e.name !== "AbortError") throw e;
+          // 不活动超时中断：提示仅发前端展示，不并入 fullReply（与 SSE 链路对称）
+          if (fullReply && timeoutController.signal.aborted && !stopCtrl.signal.aborted) {
+            sendJSON({ delta: "\n\n（回复因超时中断）" });
+          }
         } finally {
+          clearTimeout(timeoutTimer);
           localParser.flush();
           reader.releaseLock();
         }
@@ -1164,28 +1709,28 @@ async function runChatWS(ws, sessionId, message) {
 
     if (requestError !== null) {
       sendJSON({ error: `所有模型均失败: ${requestError}` });
-      if (fullReply) {
-        session.messages.push({ role: "assistant", content: fullReply, ts: Date.now() });
-      }
+      liveRunEnd(sessionId, liveRunId, "error");
+      ckpt.finalize(); // 保存已收到的部分内容（若有）
     } else {
-      session.messages.push({ role: "assistant", content: fullReply || (hadToolCalls ? "（已执行工具，未生成文字回复）" : "（Gateway 连接失败）"), ts: Date.now() });
+      const _wsContent = fullReply || (hadToolCalls ? "（已执行工具，未生成文字回复）" : (bridgeHandled ? "（已执行完成，未生成文字回复）" : "（Gateway 连接失败）"));
+      ckpt.finalize(_wsContent);
     }
-    saveSession(session);
 
-    if (!requestError && session.title === "New Chat" && session.messages.length >= 2) {
+    // 用户中断（bridge aborted）时跳过自动标题，按中断收尾
+    if (!bridgeAborted && !requestError && session.title === "New Chat" && session.messages.length >= 2) {
       autoTitle(message, primary).then(title => {
         const s2 = getSession(sessionId);
         if (s2 && s2.title === "New Chat") { s2.title = title; saveSession(s2); }
       }).catch(() => {});
     }
     sendJSON({ done: true });
+    liveRunEnd(sessionId, liveRunId, requestError !== null ? "error" : (bridgeAborted ? "interrupted" : "complete"));
   } catch (e) {
     sendJSON({ error: e.message || String(e) });
     sendJSON({ done: true });
-    // 异常时也要保存，防止用户消息和已收到的部分内容丢失
-    if (session) {
-      try { saveSession(session); } catch {}
-    }
+    if (liveRunId) liveRunEnd(sessionId, liveRunId, "error");
+    // 异常时 checkpoint 定时器释放（先前 checkpoint 保留给 resume 处理）
+    if (ckpt) ckpt.dispose();
   }
   cleanup();
 }
@@ -1194,42 +1739,7 @@ const wsHandler = {
   open(ws) {
     // Dashboard WS 反代
     if (ws.data.type === "dashboard-proxy") {
-      const { targetUrl } = ws.data;
-      if (!targetUrl) {
-        // 防御性兜底：正常情况下 node-adapter.js 已经不会再产出没有
-        // targetUrl 的连接了，这里只是避免万一出现该情况时直接把 null
-        // 传给 WebSocketClient 构造函数，导致 ws 库内部访问
-        // options.autoPong 时抛出 TypeError。
-        log(`[WS-PROXY] open with empty targetUrl, closing`);
-        try { ws.close(1011, "no target url"); } catch {}
-        return;
-      }
-      log(`[WS-PROXY] open → ${targetUrl}`);
-      try {
-        // 显式传 Host header 匹配上游 loopback 校验（_is_accepted_host）
-        const upstream = new WebSocketClient(targetUrl, {
-          headers: {
-            "Host": `${DASHBOARD_BIND}:${DASHBOARD_PORT}`,
-          },
-        });
-        ws.data.upstream = upstream;
-        upstream.addEventListener("open", () => {
-          log(`[WS-PROXY] upstream connected`);
-        });
-        upstream.addEventListener("message", (event) => {
-          try { ws.send(event.data); } catch {}
-        });
-        upstream.addEventListener("close", (event) => {
-          try { ws.close(event.code, event.reason); } catch {}
-          log(`[WS-PROXY] upstream closed code=${event.code}`);
-        });
-        upstream.addEventListener("error", () => {
-          try { ws.close(1006, "upstream error"); } catch {}
-        });
-      } catch (e) {
-        log(`[WS-PROXY] upstream connect failed: ${e?.message || e}`);
-        try { ws.close(1006, "upstream connect failed"); } catch {}
-      }
+      handleDashboardWsOpen(ws);
       return;
     }
     // 聊天 WS
@@ -1237,16 +1747,14 @@ const wsHandler = {
     log(`[WS] open session=${sessionId}`);
     runChatWS(ws, sessionId, message).catch(err => {
       log(`[WS] runChatWS error: ${err?.message || err}`);
-      try { ws.send(JSON.stringify({ error: err?.message || "internal error" })); } catch {}
-      try { ws.send(JSON.stringify({ done: true })); } catch {}
+      try { ws.send(JSON.stringify({ error: err?.message || "internal error", session_id: sessionId })); } catch {}
+      try { ws.send(JSON.stringify({ done: true, session_id: sessionId })); } catch {}
     });
   },
   message(ws, msg) {
     // Dashboard WS 反代：客户端 → 上游
     if (ws.data.type === "dashboard-proxy") {
-      if (ws.data.upstream && ws.data.upstream.readyState === 1) {
-        try { ws.data.upstream.send(msg); } catch {}
-      }
+      handleDashboardWsMessage(ws, msg);
       return;
     }
     // Chat WS：前端可发送 {"stop":true} 主动中断
@@ -1257,10 +1765,7 @@ const wsHandler = {
   },
   close(ws) {
     if (ws.data.type === "dashboard-proxy") {
-      if (ws.data.upstream) {
-        try { ws.data.upstream.close(); } catch {}
-      }
-      log(`[WS-PROXY] client closed`);
+      handleDashboardWsClose(ws);
       return;
     }
     const { sessionId, stopCtrl } = ws.data;
@@ -1297,6 +1802,19 @@ function readRawPid(path) {
     const n = Number(readFileSync(path, "utf8").trim());
     return n || null;
   } catch { return null; }
+}
+
+// bridge 专用 PID 读取：存活 pid 还需 /proc/<pid>/cmdline 含 hermes_bridge.py 才有效，
+// 防止陈旧 PID 被无关进程复用后遭健康检查/停止流程误杀；被复用时清 PID 文件按未运行处理
+function readBridgePid() {
+  const pid = readPid(PID_BRIDGE);
+  if (!pid) return null;
+  let cmdline = null;
+  try { cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " "); } catch {}
+  if (cmdline === null) return pid; // cmdline 不可读（非 /proc 环境）时不作否决
+  if (cmdline.includes("hermes_bridge.py")) return pid;
+  try { unlinkSync(PID_BRIDGE); } catch {}
+  return null;
 }
 
 async function portAlive(port, host = "localhost", timeoutMs = 2000) {
@@ -1386,6 +1904,23 @@ async function stopPid(pidPath) {
   spawnTimes.delete(pidPath);
 }
 
+// bridge 无法以独立进程组启动（node-adapter spawn 不支持 detached），
+// 停止时在 stopPid 之外按命令行匹配补杀所有 hermes_bridge.py 残留进程
+async function stopAgentBridge() {
+  readBridgePid(); // 被复用的陈旧 PID 先行清理，避免 stopPid 误杀无关进程
+  await stopPid(PID_BRIDGE);
+  for (let i = 0; i < 8; i++) {
+    const pid = findPidByCmd("hermes_bridge.py");
+    if (!pid || pid === process.pid) break;
+    try { process.kill(pid, "TERM"); } catch {}
+    await waitForExit(pid, 3000);
+    if (pidAlive(pid)) {
+      try { process.kill(pid, "KILL"); } catch {}
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+}
+
 async function forceKillHermes() {
   try {
     const proc = spawn(["pkill", "-SIGKILL", "-f", "hermes-agent.*(gateway|dashboard)"]);
@@ -1450,7 +1985,7 @@ function spawnHermes(name, pidPath, args) {
     HERMES_TUI_DIR: TUI_DIR,
     GATEWAY_ALLOW_ALL_USERS: "true",
     API_SERVER_ENABLED: "true",
-    API_SERVER_PORT:   "8642",
+    API_SERVER_PORT:   String(GATEWAY_PORT),
     API_SERVER_HOST:    "0.0.0.0",
     API_SERVER_KEY:     MONITOR_TOKEN,
     HERMES_YOLO_MODE:   "1",
@@ -1561,14 +2096,7 @@ async function getStatus() {
     } catch {}
   }
 
-  if (dp) {
-    try {
-      const r = await fetch(`http://${DASHBOARD_BIND}:${DASHBOARD_PORT}/`, {
-        signal: AbortSignal.timeout(300),
-      });
-      dbHealthy = r.ok;
-    } catch {}
-  }
+  if (dp) dbHealthy = await checkDashboardHealth();
 
   if (prevState.gwRun && !gwRunning) {
     log("Gateway stopped");
@@ -1593,361 +2121,9 @@ async function getStatus() {
 
   return {
     gateway:   { running: gwRunning, healthy: gwHealthy, pid: gp, port: GATEWAY_PORT, crash_loop: gatewayCrashLoop, version: HERMES_VERSION },
-    dashboard: { running: dbRunning, healthy: dbHealthy, pid: dp },
+    dashboard: { running: dbRunning, healthy: dbHealthy, pid: dp, port: DASHBOARD_PORT },
     lastLog,
   };
-}
-
-// 网关重启完成判定：无 systemd 环境下 `hermes gateway restart` 进程会转为常驻网关永不退出，
-// 官方 get_action_status 仅凭该进程是否退出判定完成，导致前端「重启中」永不结束。
-// 记录最近一次重启请求时刻，配合端口健康检查在代理层收尾该状态。
-const RESTART_SETTLE_MS = 6000;
-let lastGatewayRestartTs = 0;
-// 按 pid 记录首次观测到 gateway-restart 进程处于 running 的时刻。
-// 不依赖重启请求是否经代理、也不依赖日志时间戳解析，避免 monitor 重启、
-// 或日志被常驻网关写满截断时 settle 永不触发导致「重启中」卡死。
-let restartFirstSeen = { pid: 0, ts: 0 };
-
-async function proxyDashboard(req) {
-  const url     = new URL(req.url);
-  // req.url 仍含 BASE_PATH 前缀（handleFetch 只剥了 path 变量），需先去掉
-  const subPath = url.pathname
-    .replace(new RegExp(`^${BASE_PATH.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}`), "")
-    .replace(/^\/proxy\/dashboard/, "") || "/";
-  const target  = `http://${DASHBOARD_BIND}:${DASHBOARD_PORT}${subPath}${url.search}`;
-
-  const prefix = `${BASE_PATH || ""}/proxy/dashboard`;
-
-  // 记录网关重启请求时刻 + 重启前的网关 pid：既用于后续判定重启是否已实际完成，
-  // 也用于检测官方复用守卫是否发生「未真正重启」的空操作（返回 pid == 重启前 pid）。
-  let restartPreGwPid = 0;
-  if (req.method === "POST" && subPath === "/api/gateway/restart") {
-    lastGatewayRestartTs = Date.now();
-    restartPreGwPid = findGatewayPid() || 0;
-  }
-
-  try {
-    const headers = new Headers(req.headers);
-    headers.delete("host");
-    const hasReqBody = req.method !== "GET" && req.method !== "HEAD";
-    const upstream = await fetch(target, {
-      method:  req.method,
-      headers,
-      body:    hasReqBody ? req.body : undefined,
-      duplex:  hasReqBody ? "half" : undefined,
-      signal:  AbortSignal.timeout(10000),
-    });
-
-    const respHeaders = new Headers(upstream.headers);
-
-    // ── 3xx 重定向：改写 Location 头 ──
-    if (upstream.status >= 300 && upstream.status < 400) {
-      const loc = respHeaders.get("location");
-      if (loc) {
-        try {
-          const abs = new URL(loc, target);
-          respHeaders.set("location", prefix + abs.pathname + abs.search);
-        } catch {}
-      }
-      return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
-    }
-
-    const contentType = respHeaders.get("content-type") || "";
-
-    // ── 网关重启 POST：修复官方复用守卫导致的「连续第二次重启空操作」 ──
-    // 无 systemd 下 `hermes gateway restart` 进程(P1)杀旧网关后自身转为常驻网关不退出，
-    // 官方 _spawn_gateway_restart 的复用守卫见 P1 仍存活便直接 return existing(空操作)，
-    // 返回的 pid 即当前在跑的网关本体 → 第二次重启根本没重启、动作日志无新输出，
-    // 前端永久卡在「重启中/等待输出…」。检测到返回 pid == 重启前网关 pid（即未真正重启）时，
-    // 杀掉旧网关并重发一次，迫使官方 spawn 出真正的新 restart 进程。monitor 无自动重生
-    // 循环（网关仅由 /api/start、/api/restart 显式启动），故此处杀进程不会与 monitor 抢占冲突。
-    if (req.method === "POST" && subPath === "/api/gateway/restart") {
-      let bodyText = await upstream.text();
-      try {
-        const j = JSON.parse(bodyText);
-        const rpid = Number(j && j.pid) || 0;
-        if (rpid && restartPreGwPid && rpid === restartPreGwPid && isPortListening(GATEWAY_PORT)) {
-          log(`[restart] 官方复用旧网关进程 pid=${rpid}(未真正重启)，杀掉后强制重发重启`);
-          try { process.kill(rpid, "SIGTERM"); } catch {}
-          // 以端口是否仍在 LISTEN 判断旧网关是否已退出（比 pidAlive 更可靠：
-          // 进程成为 zombie 时 kill(pid,0) 仍返回存活，会误判）。
-          const deadline = Date.now() + 3000;
-          while (isPortListening(GATEWAY_PORT) && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, 100));
-          }
-          if (isPortListening(GATEWAY_PORT)) {
-            try { process.kill(rpid, "SIGKILL"); } catch {}
-            await new Promise(r => setTimeout(r, 300));
-          }
-          // 旧进程已退出，官方复用守卫的 poll() 将失效 → 重发触发真正的新 restart
-          restartFirstSeen = { pid: 0, ts: 0 };
-          lastGatewayRestartTs = Date.now();
-          const rh = new Headers(req.headers);
-          rh.delete("host");
-          // 重发不带 body，须清除原始请求的 body 相关头，否则上游等 body 超时
-          rh.delete("content-length");
-          rh.delete("content-type");
-          rh.delete("transfer-encoding");
-          try {
-            const up2 = await fetch(target, { method: "POST", headers: rh, signal: AbortSignal.timeout(10000) });
-            bodyText = await up2.text();
-            log(`[restart] 已强制重发重启，官方应 spawn 新 gateway restart 进程`);
-          } catch (e) {
-            log(`[restart] 强制重发重启失败：${e?.message || e}`);
-          }
-        }
-      } catch {}
-      respHeaders.delete("content-length");
-      respHeaders.set("cache-control", "no-store");
-      return new Response(bodyText, { status: upstream.status, headers: respHeaders });
-    }
-
-    // ── 网关重启 action 状态改写 ──
-    // `hermes gateway restart` 进程转为常驻网关不退出 → 官方永远回报 running:true。
-    // 重启实际已完成（距请求已过 settle 且网关端口健康）时改写为 running:false 收尾「重启中」。
-    if (req.method === "GET" && subPath === "/api/actions/gateway-restart/status") {
-      let bodyText = await upstream.text();
-      try {
-        const j = JSON.parse(bodyText);
-        if (j && j.running === true) {
-          const now = Date.now();
-          const pid = Number(j.pid) || 0;
-          // pid 变化视为新的重启进程，重新计时；常驻进程复用时沿用首次观测时刻
-          if (restartFirstSeen.pid !== pid) {
-            restartFirstSeen = { pid, ts: now };
-          }
-          // 以「用户最近一次点击重启」或「首次观测到 running」中较晚者为起点计 settle
-          const startedMs = Math.max(restartFirstSeen.ts, lastGatewayRestartTs || 0);
-          const settled = (now - startedMs) > RESTART_SETTLE_MS;
-          // 8642 为非 HTTP 内部端口，优先用 /proc 的 LISTEN 判据，HTTP 探活作兜底
-          const listening = isPortListening(GATEWAY_PORT);
-          const alive = settled && (listening || await portAlive(GATEWAY_PORT));
-          if (settled && alive) {
-            j.running = false;
-            if (j.exit_code === null || j.exit_code === undefined) j.exit_code = 0;
-            bodyText = JSON.stringify(j);
-            log(`[restart] 网关端口 ${GATEWAY_PORT} 健康且已 settle(${((now - startedMs) / 1000).toFixed(1)}s)，改写 gateway-restart 状态为完成以收尾「重启中」`);
-          } else {
-            log(`[restart] gateway-restart 仍 running：settled=${settled} listening=${listening} pid=${pid}`);
-          }
-        } else {
-          restartFirstSeen = { pid: 0, ts: 0 };
-        }
-      } catch {}
-      respHeaders.delete("content-length");
-      respHeaders.set("cache-control", "no-store");
-      return new Response(bodyText, { status: upstream.status, headers: respHeaders });
-    }
-
-    // ── CSS 响应：改写 url(/...) 加前缀，让字体等 url() 引用能正确路由 ──
-    if (contentType.includes("text/css") || subPath.endsWith(".css")) {
-      let css = await upstream.text();
-      css = css.replace(/url\((\/[^)'"]+)\)/g, `url(${prefix}$1)`);
-      respHeaders.delete("content-length");
-      return new Response(css, { status: upstream.status, headers: respHeaders });
-    }
-
-    // ── HTML 响应：注入 <base> + 路径改写脚本 ──
-    if (contentType.includes("text/html")) {
-      let html = await upstream.text();
-
-      // <base> 处理相对路径（CSS url()、相对 src 等）
-      html = html.replace(/<head(\s[^>]*)?>/, `<head$1><base href="${prefix}/">`);
-
-      // 静态重写 src 属性中的绝对路径（脚本、图片等）
-      html = html.replace(/\bsrc="\/(?!\/)/g, `src="${prefix}/`);
-      // 静态重写 <link href>（CSS 样式表），不改写 <a href>（SPA 路由需要原始路径）
-      html = html.replace(/<link(\s[^>]*)href="\/(?!\/)/g, (m, a) => `<link${a}href="${prefix}/`);
-
-      // 注入 JS：智能前缀管理（pushState剥离+导航感知恢复+popstate拦截）
-      const inject = `<script>
-(function(){
-  var P="${prefix}";
-  function rw(u){
-    if(typeof u!=="string")return u;
-    if(u.indexOf("//")===0||/^[a-z]+:/i.test(u))return u;
-    if(u.charAt(0)==="/"){if(u.indexOf(P)===0)return u;return P+u;}
-    return u;
-  }
-  function strip(u){
-    if(typeof u!=="string")return u;
-    if(u.indexOf(P)===0)return u.substring(P.length)||"/";
-    return u;
-  }
-  var _ps=history.pushState,_rs=history.replaceState;
-  var _pn=location.pathname;
-  /* ── 安全恢复前缀（微任务，比 rAF 更快恢复前缀） ── */
-  function sched(){
-    Promise.resolve().then(function(){
-      if(location.pathname===_pn){
-        var s=location.search||"",h=location.hash||"";
-        _rs.call(history,history.state,"",rw(_pn)+s+h);
-      }
-    });
-  }
-  /* ── 初始加载：清理 URL 让 SPA 路由启动 ── */
-  if(_pn.indexOf(P)===0){
-    var cl=_pn.substring(P.length)||"/";
-    _rs.call(history,history.state,"",cl+location.search+location.hash);
-    _pn=cl;
-    sched();
-  }
-  /* ── pushState：剥离前缀给路由，微任务恢复前缀给地址栏 ── */
-  history.pushState=function(s,t,u){
-    _pn=u?(u.split("?")[0].split("#")[0]):location.pathname;
-    var c=u?strip(u):u;
-    _ps.call(this,s,t,c);
-    if(u)sched();
-  };
-  history.replaceState=function(s,t,u){
-    _pn=u?(u.split("?")[0].split("#")[0]):location.pathname;
-    var c=u?strip(u):u;
-    _rs.call(this,s,t,c);
-    if(u)sched();
-  };
-  /* ── popstate：后退/前进时临时清理 URL ── */
-  var _ae=EventTarget.prototype.addEventListener;
-  EventTarget.prototype.addEventListener=function(type,fn,opt){
-    if(type==="popstate"&&fn){
-      var w=function(ev){
-        var cp=location.pathname;
-        var cl=cp.indexOf(P)===0?(cp.substring(P.length)||"/"):cp;
-        _rs.call(history,history.state,"",cl+location.search+location.hash);
-        _pn=cl;
-        fn.call(this,ev);
-        _rs.call(history,history.state,"",cp+location.search+location.hash);
-        _pn=cp;
-      };
-      return _ae.call(this,type,w,opt);
-    }
-    return _ae.call(this,type,fn,opt);
-  };
-  /* ── fetch / XHR：添加前缀 ── */
-  var _f=window.fetch;
-  window.fetch=function(i,o){
-    if(typeof i==="string")i=rw(i);
-    else if(i&&i.url)return _f(new Request(rw(i.url),i),o);
-    return _f.call(this,i,o);
-  };
-  var _xo=XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open=function(){
-    if(arguments.length>1)arguments[1]=rw(arguments[1]);
-    return _xo.apply(this,arguments);
-  };
-  /* ── MutationObserver：只改写 src ── */
-  function rwEl(el){
-    if(el.hasAttribute("src")){var s=el.getAttribute("src");if(s&&s.charAt(0)==="/"&&s.indexOf(P)!==0)el.setAttribute("src",P+s);}
-  }
-  new MutationObserver(function(ms){ms.forEach(function(m){if(m.type==="childList")m.addedNodes.forEach(function(n){if(n.nodeType===1){rwEl(n);n.querySelectorAll&&n.querySelectorAll("[src]").forEach(rwEl);}});});}).observe(document.documentElement,{childList:true,subtree:true});
-  document.querySelectorAll("[src]").forEach(rwEl);
-  /* ── hook HTMLScriptElement.src setter：createElement("script") 后 v.src=...
-     走的不是 fetch/XHR，需要在这里加前缀 ── */
-  var _sp=HTMLScriptElement.prototype,_sd=Object.getOwnPropertyDescriptor(_sp,"src");
-  if(_sd&&_sd.set){var _ss=_sd.set,_sg=_sd.get;Object.defineProperty(_sp,"src",{get:function(){return _sg?_sg.call(this):undefined;},set:function(v){if(typeof v==="string"&&v.charAt(0)==="/"&&v.indexOf(P)!==0)v=P+v;_ss.call(this,v);},configurable:true,enumerable:_sd.enumerable});}
-  /* ── hook HTMLLinkElement.href setter：createElement("link") 后 x.href=...
-     走的不是 fetch/XHR，需要在这里加前缀 ── */
-  var _lp=HTMLLinkElement.prototype,_ld=Object.getOwnPropertyDescriptor(_lp,"href");
-  if(_ld&&_ld.set){var _ls=_ld.set,_lg=_ld.get;Object.defineProperty(_lp,"href",{get:function(){return _lg?_lg.call(this):undefined;},set:function(v){if(typeof v==="string"&&v.charAt(0)==="/"&&v.indexOf(P)!==0)v=P+v;_ls.call(this,v);},configurable:true,enumerable:_ld.enumerable});}
-  /* ── hook WebSocket：给 dashboard WS URL 加前缀，路由到 monitor 反代 ── */
-  var _WS=window.WebSocket;
-  /* iOS 第三方输入法(如百度)在 xterm 终端无法输入的补偿所需：
-     捕获 /api/pty 连接并包裹其 send 以记录 xterm 实际发出的输入 */
-  var _activePty=null, _ptySent=[];
-  function _hookPty(sock, pathname){
-    try{
-      if(!sock||!pathname||pathname.indexOf("/api/pty")===-1)return sock;
-      _activePty=sock;
-      var _os=sock.send;
-      sock.send=function(d){
-        try{
-          var s=(typeof d==="string")?d:(d?new TextDecoder().decode(d):"");
-          if(s){_ptySent.push({t:Date.now(),s:s});if(_ptySent.length>80)_ptySent.shift();}
-        }catch(e){}
-        return _os.apply(this,arguments);
-      };
-      sock.addEventListener("close",function(){if(_activePty===sock)_activePty=null;});
-    }catch(e){}
-    return sock;
-  }
-  window.WebSocket=function(url,protocols){
-    try{
-      if(typeof url==="string"){
-        var u=new URL(url,location.origin);
-        if(u.pathname.charAt(0)==="/"&&u.pathname.indexOf(P)!==0){
-          var newUrl=(location.protocol==="https:"?"wss:":"ws:")+"//"+location.host+P+u.pathname+(u.search||"")+(u.hash||"");
-          return _hookPty(new _WS(newUrl,protocols),u.pathname);
-        }
-        return _hookPty(new _WS(url,protocols),u.pathname);
-      }
-    }catch(e){}
-    return new _WS(url,protocols);
-  };
-  window.WebSocket.prototype=_WS.prototype;
-  /* 关键：保留构造器静态常量（CONNECTING/OPEN/CLOSING/CLOSED）。
-     dashboard 前端发送输入前常用 ws.readyState===WebSocket.OPEN 做门禁；
-     覆盖构造器若丢掉这些常量，OPEN 变 undefined → 门禁永不成立 → 输入帧发不出去
-     （服务端推来的输出仍走 onmessage，故表现为“画面能显示、但无法输入/发送”）。 */
-  window.WebSocket.CONNECTING=_WS.CONNECTING;
-  window.WebSocket.OPEN=_WS.OPEN;
-  window.WebSocket.CLOSING=_WS.CLOSING;
-  window.WebSocket.CLOSED=_WS.CLOSED;
-  /* ── iOS 第三方输入法(百度等)组合输入补偿 ──
-     现象：iPhone 上用第三方 IME 在 Dashboard 终端(xterm)对话打不出字，自带键盘正常。
-     根因：部分第三方 IME 的组合提交未触发 xterm 期望的事件序列，组合文字从不经
-     /api/pty 发出。这里在组合结束/插入后核对：若该文字未被 xterm 经 pty socket 发出，
-     则由我们补发到 /api/pty（服务端 pty_ws 同时接受 text/bytes 帧，text 按 UTF-8 编码）。
-     去重：仅当“事件发生之后”pty 未发出该文字才补发；xterm 正常处理会在事件后立即发出，
-     且我们自己的补发也会被记录，天然避免重复；不同次提交按时间戳区分，允许连续重复字。 */
-  function _isTermTarget(t){
-    try{return !!(t&&((t.classList&&t.classList.contains("xterm-helper-textarea"))||(t.closest&&t.closest(".xterm"))));}
-    catch(e){return false;}
-  }
-  function _ptyReconcileSend(text,mark){
-    if(!text||!_activePty||_activePty.readyState!==1)return;
-    setTimeout(function(){
-      try{
-        if(!_activePty||_activePty.readyState!==1)return;
-        var after="";
-        for(var i=0;i<_ptySent.length;i++){if(_ptySent[i].t>=mark-5)after+=_ptySent[i].s;}
-        if(after.indexOf(text)!==-1)return;   /* xterm 已发出，勿重复 */
-        _activePty.send(text);
-      }catch(e){}
-    },80);
-  }
-  document.addEventListener("compositionend",function(ev){
-    try{if(ev&&ev.data&&_isTermTarget(ev.target))_ptyReconcileSend(String(ev.data),Date.now());}catch(e){}
-  },true);
-  document.addEventListener("input",function(ev){
-    try{
-      if(!ev||ev.isComposing||!ev.data||!_isTermTarget(ev.target))return;
-      if(ev.inputType&&ev.inputType!=="insertText"&&ev.inputType!=="insertCompositionText")return;
-      _ptyReconcileSend(String(ev.data),Date.now());
-    }catch(e){}
-  },true);
-})();
-<\/script>`;
-
-      html = html.replace("</head>", inject + "\n</head>");
-
-      respHeaders.delete("content-length");
-      respHeaders.delete("content-encoding");
-      return new Response(html, { status: upstream.status, headers: respHeaders });
-    }
-
-    // ── 非 HTML 响应：原样透传 ──
-    return new Response(upstream.body, {
-      status:  upstream.status,
-      headers: respHeaders,
-    });
-  } catch (e) {
-    // 连接拒绝/Dashboard 未就绪属正常现象（启动期间），仅非预期错误才记录
-    const msg = e?.message || '';
-    if (msg && !/connect|refused|abort|ECONN/i.test(msg)) log(`proxy error: ${msg}`);
-    return new Response(JSON.stringify({ error: "Dashboard unavailable" }), {
-      status:  502,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
 }
 
 function createLogStream(req, lastOffset) {
@@ -2038,6 +2214,41 @@ async function serveFile(filePath, contentType) {
   }
 }
 
+// ─── 频道配置模块初始化 ─────────────────────────────────────────────────
+let channelRestartInFlight = false; // 网关重启互斥：重启进行中时后续请求合并跳过
+let manualStopEpoch = 0; // /api/stop 的时间戳：渠道重启回调据此判断是否放弃拉起网关
+initChannels({ dataDir: DATA_DIR, log, restartGateway: async (reason) => {
+  if (channelRestartInFlight) { log(`[channels] 重启进行中，合并请求: ${reason}`); return; }
+  channelRestartInFlight = true;
+  const startedAt = Date.now();
+  try {
+    log(`[channels] 重启网关: ${reason}`);
+    await stopPid(PID_GATEWAY);
+    await new Promise(r => setTimeout(r, 800));
+    if (manualStopEpoch > 0) { log(`[channels] 处于停机/重启窗口，跳过网关拉起: ${reason}`); return; }
+    resetGatewayCrashLoop(); // 解除 crash-loop 封锁，允许配置变更后重新拉起
+    spawnHermes("gateway", PID_GATEWAY, ["gateway", "run"]);
+  } catch (e) {
+    log(`[channels] 重启网关失败: ${e?.message || e}`);
+  } finally {
+    channelRestartInFlight = false;
+  }
+}, nodeBin: resolvedNodeBin, nodeDir: resolvedNodeDir });
+
+// ─── Agent Bridge 保活器（退出自动重启 + 健康检查，逻辑在 bridge-keeper.js）──
+bridgeKeeper = createBridgeKeeper({
+  log,
+  restart: () => startAgentBridge(),
+  stop: () => stopAgentBridge(),
+  ping: () => bridgeRequest({ action: "ping" }, BRIDGE_HEALTH_PING_TIMEOUT_MS),
+  getPid: () => readBridgePid(),
+  isManualStopped: () => manualStopEpoch > 0,
+});
+bridgeKeeper.startHealthLoop();
+
+// 应用包版本更新检查器（/api/update/check 用，内置 1 小时缓存）
+const appUpdateChecker = createUpdateChecker({ appDir: APP_DIR, log });
+
 // ─── 请求处理器 ─────────────────────────────────────────────────────────
 async function handleFetch(req) {
   const url  = new URL(req.url);
@@ -2067,9 +2278,9 @@ async function handleFetch(req) {
   });
 
   // 需要令牌的变更操作（仅写操作，GET 不需要 token）
-  const writePaths = ["/api/start", "/api/stop", "/api/restart", "/api/dashboard/start", "/api/dashboard/stop", "/api/config", "/api/config/test", "/api/hermes/update", "/api/logs/clear"];
+  const writePaths = ["/api/start", "/api/stop", "/api/restart", "/api/dashboard/start", "/api/dashboard/stop", "/api/config", "/api/config/test", "/api/config/detect-format", "/api/hermes/update", "/api/logs/clear"];
   const isWrite = ["POST", "PUT", "DELETE"].includes(req.method);
-  if (isWrite && writePaths.includes(path) && !checkToken(req)) {
+  if (isWrite && (writePaths.includes(path) || path.startsWith("/api/channels/")) && !checkToken(req)) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
       status: 401,
       headers: jsonHeaders(),
@@ -2140,9 +2351,15 @@ async function handleFetch(req) {
       token: MONITOR_TOKEN,
       transport: SOCKET_PATH ? "unix" : "tcp",
       socket_path: SOCKET_PATH || null,
-      api_server_port: 8642,
-      api_server_url: `http://${getLANIP()}:8642`,
+      api_server_port: GATEWAY_PORT,
+      api_server_url: `http://${getLANIP()}:${GATEWAY_PORT}`,
     }), { headers: jsonHeaders() });
+  }
+
+  // ── 应用包版本更新检查（模块内含缓存与失败降级，绝不 500）──
+  if (path === "/api/update/check") {
+    const payload = await appUpdateChecker.check();
+    return new Response(JSON.stringify(payload), { headers: jsonHeaders() });
   }
 
   // ── Hermes 自更新（直接使用 uv，不依赖 dashboard）────────
@@ -2151,12 +2368,12 @@ async function handleFetch(req) {
   // GET  /api/hermes/update/status → 轮询更新进度
   if (path === "/api/hermes/update/check") {
     try {
-      // 每次检查都重新运行 hermes --version，确保版本准确（不依赖缓存）
+      // 每次检查都重新运行 hermes --version，确保版本准确（不依赖缓存）；
+      // 异步执行并限 5 秒，避免同步子进程冻结事件循环拖住其它请求
       let current = HERMES_VERSION;
       try {
-        const vr = spawnSync(HERMES_BIN_PATH, ["--version"], { stdout: "pipe", stderr: "pipe" });
-        const vOut = ((vr.stdout ? vr.stdout.toString() : "").trim())
-                  || ((vr.stderr ? vr.stderr.toString() : "").trim());
+        const vr = await runCmdAsync(HERMES_BIN_PATH, ["--version"], 5000);
+        const vOut = vr.stdout || vr.stderr;
         if (vOut) {
           current = formatHermesVersion(vOut);
           if (current !== HERMES_VERSION) {
@@ -2303,9 +2520,9 @@ async function handleFetch(req) {
     let currentVer = HERMES_VERSION;
     if (updateState === "done") {
       try {
-        const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], { stdout: "pipe", stderr: "pipe" });
-        const verOut = ((verResult.stdout ? verResult.stdout.toString() : "").trim())
-                    || ((verResult.stderr ? verResult.stderr.toString() : "").trim());
+        // 异步执行并限 5 秒，避免同步子进程冻结事件循环拖住其它请求
+        const verResult = await runCmdAsync("sh", ["-c", `${HERMES_BIN_PATH} --version`], 5000);
+        const verOut = verResult.stdout || verResult.stderr;
         if (verOut) {
           currentVer = formatHermesVersion(verOut);
           HERMES_VERSION = currentVer;
@@ -2335,52 +2552,60 @@ async function handleFetch(req) {
     if (!hasRealProvider) {
       return new Response(JSON.stringify({ ok: false, error: "请先在设置中添加至少一个模型服务商" }), { status: 400, headers: jsonHeaders() });
     }
+    manualStopEpoch = 0; // 解除手动停机态，恢复 bridge 保活
     const r1 = spawnHermes("gateway",   PID_GATEWAY,   ["gateway", "run"]);
-    const r2 = spawnHermes("dashboard", PID_DASHBOARD, ["dashboard", "--host", DASHBOARD_BIND, "--port", String(DASHBOARD_PORT), "--no-open", "--insecure"]);
-    return new Response(JSON.stringify({ gateway: r1, dashboard: r2 }), { headers: jsonHeaders() });
+    const r2 = spawnDashboard();
+    const r3 = startAgentBridge(); // 失败容忍：仅记日志，对话自动降级 HTTP SSE
+    return new Response(JSON.stringify({ gateway: r1, dashboard: r2, bridge: r3 }), { headers: jsonHeaders() });
   }
 
   if (path === "/api/stop" && req.method === "POST") {
+    manualStopEpoch = Date.now(); // 阻止进行中的渠道重启回调再拉起网关，并暂停 bridge 保活重启
     const gwAlive = readPid(PID_GATEWAY);
     const dbAlive = readPid(PID_DASHBOARD);
+    const brAlive = readBridgePid();
     await stopPid(PID_GATEWAY);
     await stopPid(PID_DASHBOARD);
+    await stopAgentBridge();
     await forceKillHermes();
     resetGatewayCrashLoop();
     if (gwAlive) log("Gateway stopped (pid=" + gwAlive + ")");
     if (dbAlive) log("Dashboard stopped (pid=" + dbAlive + ")");
+    if (brAlive) log("Agent Bridge stopped (pid=" + brAlive + ")");
     if (!gwAlive && !dbAlive) log("Stop: no running processes");
     return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
   }
 
   if (path === "/api/restart" && req.method === "POST") {
     log("Restarting gateway ...");
-    await stopPid(PID_GATEWAY);
-    await stopPid(PID_DASHBOARD);
-    await forceKillHermes();
-    resetGatewayCrashLoop();
-    await new Promise(r => setTimeout(r, 1500));
-    const r1 = spawnHermes("gateway",   PID_GATEWAY,   ["gateway", "run"]);
-    const r2 = spawnHermes("dashboard", PID_DASHBOARD, ["dashboard", "--host", DASHBOARD_BIND, "--port", String(DASHBOARD_PORT), "--no-open", "--insecure"]);
-    return new Response(JSON.stringify({ gateway: r1, dashboard: r2 }), { headers: jsonHeaders() });
+    manualStopEpoch = Date.now(); // 重启期间的 bridge 退出属预期，暂停保活重启
+    // 重启流程在后台异步执行，接口立即返回；停止等待（最长约 15 秒）不再阻塞响应，
+    // 前端恢复状态由既有的 /api/status 轮询自然反映（对齐控制面板重启的交互模式）
+    (async () => {
+      try {
+        await stopPid(PID_GATEWAY);
+        await stopPid(PID_DASHBOARD);
+        await stopAgentBridge();
+        await forceKillHermes();
+        resetGatewayCrashLoop();
+        await new Promise(r => setTimeout(r, 1500));
+      } finally {
+        manualStopEpoch = 0; // 任何异常路径都复位，避免保活被永久禁用
+      }
+      spawnHermes("gateway",   PID_GATEWAY,   ["gateway", "run"]);
+      spawnDashboard();
+      startAgentBridge(); // 失败容忍：仅记日志，对话自动降级 HTTP SSE
+    })().catch(e => log(`Restart failed: ${e?.message || e}`));
+    return new Response(JSON.stringify({ ok: true, restarting: true }), { headers: jsonHeaders() });
   }
 
   // Dashboard 独立启停
   if (path === "/api/dashboard/start" && req.method === "POST") {
-    const r = spawnHermes("dashboard", PID_DASHBOARD, ["dashboard", "--host", DASHBOARD_BIND, "--port", String(DASHBOARD_PORT), "--no-open", "--insecure"]);
-    return new Response(JSON.stringify({ dashboard: r }), { headers: jsonHeaders() });
+    return handleDashboardStart(jsonHeaders);
   }
 
   if (path === "/api/dashboard/stop" && req.method === "POST") {
-    const dbAlive = readPid(PID_DASHBOARD);
-    await stopPid(PID_DASHBOARD);
-    // 强制杀掉残留的 dashboard 进程（PID 文件可能已失效）
-    try {
-      const proc = spawn(["pkill", "-SIGKILL", "-f", "hermes-agent.*dashboard"]);
-      await proc.exited;
-    } catch {}
-    if (dbAlive) log("Dashboard stopped (pid=" + dbAlive + ")");
-    return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
+    return handleDashboardStop(jsonHeaders);
   }
 
   if (path === "/api/logs") {
@@ -2450,14 +2675,88 @@ async function handleFetch(req) {
     return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
   }
 
+  // ─── 频道 bot 配置路由 ─────────────────────────────────────────────────
+  if (path === "/api/channels" && req.method === "GET") {
+    return new Response(JSON.stringify(handleGetChannels()), { headers: jsonHeaders() });
+  }
+  const chToggleMatch = path.match(/^\/api\/channels\/([^/]+)\/toggle$/);
+  if (chToggleMatch && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const res = handleToggleChannel(decodeURIComponent(chToggleMatch[1]), body);
+      return new Response(JSON.stringify(res), { status: res.ok ? 200 : 400, headers: jsonHeaders() });
+    } catch (e) { return new Response(JSON.stringify({ ok: false, error: e?.message || "bad request" }), { status: 400, headers: jsonHeaders() }); }
+  }
+  // 微信扫码保存：专用分支须先于通用 /api/channels/:id 保存分支匹配
+  if (path === "/api/channels/weixin" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const r = handleWeixinSave(body);
+      return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+    } catch (e) { return new Response(JSON.stringify({ ok: false, error: e?.message || "bad request" }), { status: 400, headers: jsonHeaders() }); }
+  }
+  const chMatch = path.match(/^\/api\/channels\/([^/]+)$/);
+  if (chMatch && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const res = handleSaveChannel(decodeURIComponent(chMatch[1]), body);
+      return new Response(JSON.stringify(res), { status: res.ok ? 200 : 400, headers: jsonHeaders() });
+    } catch (e) { return new Response(JSON.stringify({ ok: false, error: e?.message || "bad request" }), { status: 400, headers: jsonHeaders() }); }
+  }
+
+  // ─── 频道扫码流程路由（微信 / Telegram / WhatsApp）───────────────
+  if (path === "/api/channels/weixin/qr" && req.method === "GET") {
+    const r = await handleWeixinQr();
+    return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+  }
+  if (path === "/api/channels/weixin/qr/status" && req.method === "GET") {
+    const qrcode = url.searchParams.get("qrcode") || "";
+    const r = await handleWeixinQrStatus(qrcode);
+    return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+  }
+  if (path === "/api/channels/telegram/qr" && req.method === "GET") {
+    const botName = url.searchParams.get("bot_name") || "";
+    const r = await handleTelegramQr(botName);
+    return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+  }
+  if (path === "/api/channels/telegram/qr/status" && req.method === "GET") {
+    const pairingId = url.searchParams.get("pairing_id") || "";
+    const r = await handleTelegramQrStatus(pairingId);
+    return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+  }
+  if (path === "/api/channels/telegram/qr/apply" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const r = handleTelegramQrApply(body);
+      return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+    } catch (e) { return new Response(JSON.stringify({ ok: false, error: e?.message || "bad request" }), { status: 400, headers: jsonHeaders() }); }
+  }
+  if (path === "/api/channels/whatsapp/qr" && req.method === "GET") {
+    const mode = url.searchParams.get("mode") || "self-chat";
+    const r = await handleWhatsAppQr(mode);
+    return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+  }
+  if (path === "/api/channels/whatsapp/qr/status" && req.method === "GET") {
+    const pairingId = url.searchParams.get("pairing_id") || "";
+    const r = handleWhatsAppQrStatus(pairingId);
+    return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+  }
+  if (path === "/api/channels/whatsapp/qr/apply" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const r = handleWhatsAppQrApply(body);
+      return new Response(JSON.stringify(r.body), { status: r.status, headers: jsonHeaders() });
+    } catch (e) { return new Response(JSON.stringify({ ok: false, error: e?.message || "bad request" }), { status: 400, headers: jsonHeaders() }); }
+  }
+
   // ─── 聊天：配置 API ──────────────────────────────────────────────────────
   if (path === "/api/config" && req.method === "GET") {
     // ── 读取 providers-state.yaml（控制面板专属配置文件）────────────
-    const statePath = `${VAR_DIR}/providers-state.yaml`;
     let ymlProviders = [];
     let activeProvName = "";
     let activeModel = "";
     let provModelMap = {}; // { "minimax-cn": "MiniMax-M2.7", ... }
+    let fallbackIds = [];  // 面板回退模型 id 列表（解析自 config.yaml 顶层 fallback_providers）
 
     try {
       // 读取 Hermes config.yaml 获取当前 active provider
@@ -2469,6 +2768,7 @@ async function handleFetch(req) {
         const modelMatch = yml.match(/^model:\s*\n\s+default:\s*(\S+)/m);
         provId = provMatch ? provMatch[1] : "";
         activeModel = modelMatch ? modelMatch[1] : "";
+        fallbackIds = parseFallback(yml);
       }
 
       // 读取控制面板专属 .env.providers 获取 API keys
@@ -2510,35 +2810,8 @@ async function handleFetch(req) {
         }
       } catch (e) {}
 
-      if (existsSync(statePath)) {
-        const stateYaml = readFileSync(statePath, "utf8");
-        // 解析格式: providers:\n  id:\n    model: xxx\n    base_url: yyy\n    name: "zzz"
-        const blockMatch = stateYaml.match(/^providers:\n([\s\S]*)$/m);
-        if (blockMatch) {
-          const lines = blockMatch[1].split("\n");
-          let currentId = null, currentModel = "", currentBaseUrl = "", currentName = "";
-          lines.forEach(line => {
-            const keyMatch = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/);
-            if (keyMatch) {
-              // 保存上一个
-              if (currentId && currentModel) {
-                provModelMap[currentId] = { model: currentModel, base_url: currentBaseUrl || "", name: currentName || "" };
-              }
-              currentId = keyMatch[1]; currentModel = ""; currentBaseUrl = ""; currentName = "";
-              return;
-            }
-            const m = line.match(/^    model:\s*(.+)\s*$/);
-            if (m && currentId) { currentModel = m[1].trim(); return; }
-            const b = line.match(/^    base_url:\s*(.+)\s*$/);
-            if (b && currentId) { currentBaseUrl = b[1].trim(); return; }
-            const n = line.match(/^    name:\s*(.+)\s*$/);
-            if (n && currentId) { try { currentName = JSON.parse(n[1].trim()); } catch { currentName = n[1].trim(); } }
-          });
-          if (currentId && currentModel) {
-            provModelMap[currentId] = { model: currentModel, base_url: currentBaseUrl || "", name: currentName || "" };
-          }
-        }
-      }
+      // 解析 providers-state.yaml（格式: providers:\n  id:\n    model: xxx ...；共享解析逻辑在 primary-config.js）
+      provModelMap = loadProvidersState();
 
       // ── 迁移：providers-state.yaml 为空时，从 .env.providers 反推 ───
       if (Object.keys(provModelMap).length === 0) {
@@ -2568,14 +2841,16 @@ async function handleFetch(req) {
           type: "openai-compatible",
           base_url: preset ? preset.base_url : baseUrl,
           model,
-          temperature: 0.7,
-          max_tokens: 4096,
+          temperature: info.temperature ?? 0.7,
+          max_tokens: info.max_tokens ?? 4096,
           api_key_masked: maskedKey,
           api_key_configured: !!envApiKeys[id],
           is_custom: isCustom,
+          // API 格式：空串表示自动识别（保存时按 URL/key 启发式判定）
+          api_format: (typeof info === "object" && info.api_format) || "",
         });
       });
-    } catch (e) { /* 非致命错误 */ }
+    } catch (e) {}
 
     // 首次安装无 config.yaml 时，注入默认 Hermes Gateway，避免前端 POST 时 active_provider 为空导致 400
     if (ymlProviders.length === 0) {
@@ -2605,7 +2880,8 @@ async function handleFetch(req) {
     const safe = {
       providers: visibleProviders,
       active_provider: activeProvName,
-      fallback_providers: [],
+      // 只返回仍存在于面板列表中的回退 id（被删商自动失效）
+      fallback_providers: fallbackIds.filter(id => visibleProviders.some(p => p.id === id)),
       _version: CONFIG_VERSION,
       presets: Object.keys(PROVIDER_PRESETS).map(id => ({
         id,
@@ -2638,32 +2914,9 @@ async function handleFetch(req) {
 
       // ── 收集所有 provider 的模型 + base_url + 自定义名称 ────────────────────────
       const allProvConfig = {};
-      // 先读现有的 providers-state.yaml（保留未编辑的 provider）
-      const statePath = `${VAR_DIR}/providers-state.yaml`;
+      // 先读现有的 providers-state.yaml（保留未编辑的 provider；共享解析逻辑在 primary-config.js）
       try {
-        if (existsSync(statePath)) {
-          const stateYaml = readFileSync(statePath, "utf8");
-          const blockMatch = stateYaml.match(/^providers:\n([\s\S]*)$/m);
-          if (blockMatch) {
-            const lines = blockMatch[1].split("\n");
-            let curId = null, curModel = "", curBase = "", curName = "";
-            lines.forEach(line => {
-              const km = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/);
-              if (km) {
-                if (curId && curModel) allProvConfig[curId] = { model: curModel, base_url: curBase, name: curName };
-                curId = km[1]; curModel = ""; curBase = ""; curName = "";
-                return;
-              }
-              const mm = line.match(/^    model:\s*(.+)\s*$/);
-              if (mm && curId) { curModel = mm[1].trim(); return; }
-              const bm = line.match(/^    base_url:\s*(.+)\s*$/);
-              if (bm && curId) { curBase = bm[1].trim(); return; }
-              const nm = line.match(/^    name:\s*(.+)\s*$/);
-              if (nm && curId) { try { curName = JSON.parse(nm[1].trim()); } catch { curName = nm[1].trim(); } }
-            });
-            if (curId && curModel) allProvConfig[curId] = { model: curModel, base_url: curBase, name: curName };
-          }
-        }
+        Object.assign(allProvConfig, loadProvidersState());
       } catch (e) {}
 
       // 合并 body.providers 的数据（前端传来的优先，包括自定义名称 name）
@@ -2676,7 +2929,7 @@ async function handleFetch(req) {
         }
         const existingEntry = allProvConfig[p.id];
         const incomingName = (p.name && String(p.name).trim()) || "";
-        // base_url：A 类内置商强制存 PROVIDER_PRESETS 默认 URL（编辑框只读，地址由 Hermes 管理），
+        // base_url：A 类内置服务商强制存 PROVIDER_PRESETS 默认 URL（编辑框只读，地址由 Hermes 管理），
         // B 类/custom 存用户填写值；确保 providers-state.yaml 对所有商都保存完整 URL 供编辑框回显。
         let baseUrl;
         if (PROVIDER_CLASSES[p.id] === "A" && PROVIDER_PRESETS[p.id]) {
@@ -2686,10 +2939,21 @@ async function handleFetch(req) {
           // 内置预设兜底：用户未填时回填默认 URL
           if (!baseUrl && PROVIDER_PRESETS[p.id]) baseUrl = PROVIDER_PRESETS[p.id].base_url || "";
         }
+        const incomingTemp = p.temperature != null ? parseFloat(p.temperature) : null;
+        const incomingMax = p.max_tokens != null ? parseInt(p.max_tokens, 10) : null;
+        // API 格式：前端显式传值（openai/anthropic）优先；缺省时保留已存值（自动识别态为空串）
+        let incomingFmt = p.api_format !== undefined ? normalizeApiFormat(p.api_format) : null;
+        // key 前缀启发式只在保存时拿得到明文 key：自动识别态下 sk-ant- 前缀固化为 anthropic
+        if (!incomingFmt && p._raw_api_key && String(p._raw_api_key).startsWith("sk-ant-")) {
+          incomingFmt = "anthropic";
+        }
         allProvConfig[p.id] = {
           model,
           base_url: baseUrl,
           name: incomingName || existingEntry?.name || "",
+          temperature: (incomingTemp != null && !isNaN(incomingTemp)) ? incomingTemp : (existingEntry?.temperature ?? null),
+          max_tokens: (incomingMax != null && !isNaN(incomingMax)) ? incomingMax : (existingEntry?.max_tokens ?? null),
+          api_format: incomingFmt != null ? incomingFmt : (existingEntry?.api_format || ""),
         };
       });
 
@@ -2702,339 +2966,62 @@ async function handleFetch(req) {
       }
 
       // ── 写入 providers-state.yaml ───────────────────────────────────────────
-      try {
-        const stateLines = Object.entries(allProvConfig)
-          .sort(([a], [b]) => {
-            // active provider 排第一，其余按 id 字母排序
-            if (a === providerId) return -1;
-            if (b === providerId) return 1;
-            return a.localeCompare(b);
-          })
-          .map(([id, cfg]) => {
-            let entry = `  ${id}:\n    model: ${cfg.model}`;
-            if (cfg.base_url) entry += `\n    base_url: ${cfg.base_url}`;
-            if (cfg.name) entry += `\n    name: ${JSON.stringify(cfg.name)}`;
-            return entry;
-          })
-          .join("\n");
-        const stateContent = `providers:\n${stateLines}\n`;
-        writeFileSync(statePath, stateContent);
-      } catch (e) {
-        // 非致命错误
-      }
+      writeProvidersState(allProvConfig, providerId);
 
       // ── 同步 model section + 自定义 provider 到 Hermes config.yaml ───────────
-      const resolvedModel = allProvConfig[providerId]?.model || "auto";
-      const yamlPath = `${DATA_DIR}/config.yaml`;
+      // 回退模型 id 列表（首期单选）：校验存在于面板列表且 ≠ active provider；
+      //    null 表示本次请求未携带该字段，config.yaml 现有回退配置保持不动；
+      //    被删 provider 已被上方白名单过滤剔出 allProvConfig，此处联动清空（双保险）。
+      const fallbackIds = Array.isArray(body.fallback_providers)
+        ? body.fallback_providers.filter(id => allProvConfig[id] && id !== providerId).slice(0, 1)
+        : null;
 
-      // YAML 标量安全序列化：含 YAML 特殊字符时加引号，否则保持 plain（匹配 Hermes 文档格式）
-      const yamlScalar = (val) => {
-        const s = String(val == null ? "" : val);
-        const risky = s === "" ||
-          /^[\s>|@`"'%#&*!?\[\]{},-]/.test(s) ||   // 危险起始字符
-          /\s$/.test(s) ||                          // 结尾空白
-          /:(\s|$)/.test(s) ||                      // 冒号后接空格/行尾
-          /\s#/.test(s);                            // 空格+井号（YAML 行内注释）
-        return risky ? JSON.stringify(s) : s;
-      };
-
-      // ── 构建 providers: 段（A/B 分类，详见 provider-config.js 的 PROVIDER_CLASSES） ──
-      //   A 类内置商仅写 model 段，端点与原生协议交给 Hermes 内置 PROVIDER_REGISTRY；
-      //   B 类内置商（siliconflow / mistral / ollama-cloud）与所有非预设 custom-* 必须写 providers 段。
-      const customEntries = Object.entries(allProvConfig)
-        .sort(([a], [b]) => {
-          if (a === providerId) return -1;
-          if (b === providerId) return 1;
-          return a.localeCompare(b);
-        })
-        .filter(([id]) => !PROVIDER_PRESETS[id] || PROVIDER_CLASSES[id] === "B")
-        .map(([id, pcfg]) => {
-          const baseUrl = String(pcfg.base_url || "").trim();
-          if (!baseUrl) {
-            log(`跳过 provider "${id}"：缺少 base_url，未写入 config.yaml providers 段`);
-            return null;
-          }
-          // 本地模型（local-* 动态 id）：本地 OpenAI 兼容服务无需鉴权，
-          // 仅写 base_url + default_model，完全省略 api_key（Hermes config.py 支持缺省，
-          // runtime_provider.py 会自动兜底 "no-key-required" 占位）。
-          if (String(id).indexOf("local-") === 0) {
-            return `  ${id}:\n` +
-                   `    base_url: ${yamlScalar(baseUrl)}\n` +
-                   `    default_model: ${yamlScalar(pcfg.model || "auto")}`;
-          }
-          // env 名：B 类预设用 PROVIDER_API_KEYS[id]，custom-* 用 customEnvKey(id)
-          const envVar = PROVIDER_API_KEYS[id] || customEnvKey(id);
-          // 用户实机验证格式：base_url + api_key（${ENV} 插值）+ default_model，省略 api_mode
-          return `  ${id}:\n` +
-                 `    base_url: ${yamlScalar(baseUrl)}\n` +
-                 `    api_key: \${${envVar}}\n` +
-                 `    default_model: ${yamlScalar(pcfg.model || "auto")}`;
-        })
-        .filter(Boolean);
-      const providersBlock = customEntries.length > 0 ? `providers:\n${customEntries.join("\n")}\n` : "";
-
-      try {
-        let ymlContent = existsSync(yamlPath) ? readFileSync(yamlPath, "utf8") : "";
-        // model.provider 经 PROVIDER_HERMES_IDS 映射（openai → openai-api，其余用自身 id）
-        const hermesProvider = PROVIDER_HERMES_IDS[providerId] || providerId;
-        const newModel = `model:\n  provider: ${hermesProvider}\n  default: ${resolvedModel}\n`;
-        const modelRegex = /^model:[\t ]*\n(?:[\t ]+[^\n]*\n)*/m;
-        if (ymlContent.match(modelRegex)) {
-          ymlContent = ymlContent.replace(modelRegex, newModel);
-        } else {
-          ymlContent = newModel + "\n" + ymlContent;
-        }
-
-        // 同步 providers: 段——兼容模板里的 `providers: {}` 空映射与已存在的多行块两种形态，
-        // 避免产生重复的 providers 顶层键。无 B/custom 条目时整段省略 providers 节，
-        // A 类 active 且无自定义商时 config.yaml 只保留 model 段（贴合用户实机验证格式）。
-        const _NL = String.fromCharCode(10);
-        const _TAB = String.fromCharCode(9);
-        const _yl = ymlContent.split(_NL);
-        let _ps = -1;
-        for (let _i = 0; _i < _yl.length; _i++) {
-          if (_yl[_i].indexOf("providers:") === 0) { _ps = _i; break; }
-        }
-        if (_ps >= 0) {
-          let _pe = _ps + 1;
-          while (_pe < _yl.length && (_yl[_pe].startsWith(" ") || _yl[_pe].startsWith(_TAB))) _pe++;
-          const _before = _yl.slice(0, _ps).join(_NL);
-          const _after = _yl.slice(_pe).join(_NL);
-          if (providersBlock) {
-            ymlContent = (_before ? _before + _NL : "") + providersBlock + _after;
-          } else {
-            // 无 B/custom 条目：纯删除原 providers 段，仅拼接 _before + _after
-            ymlContent = _before + (_after ? _NL + _after : _NL);
-          }
-        } else if (providersBlock) {
-          // 将 providers 段插入 model 段正下方（而非追加到文件末尾）
-          const _modelBlockRe = /(^model:[\t ]*\n(?:[\t ]+[^\n]*\n)*)/m;
-          const _modelMatch = ymlContent.match(_modelBlockRe);
-          if (_modelMatch) {
-            const _insertPos = _modelMatch.index + _modelMatch[0].length;
-            ymlContent = ymlContent.slice(0, _insertPos) + providersBlock + ymlContent.slice(_insertPos);
-          } else {
-            // model 段也不存在时，退化为插到文件开头
-            ymlContent = providersBlock + ymlContent;
-          }
-        }
-
-        writeFileSync(yamlPath, ymlContent);
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: "write config.yaml: " + e.message }), { status: 500, headers: jsonHeaders() });
+      // 构建与写入逻辑在 primary-config.js；写失败属致命错误，返回 500。
+      const cfgWrite = writeConfigYaml({ allProvConfig, providerId, fallbackIds });
+      if (!cfgWrite.ok) {
+        return new Response(JSON.stringify({ ok: false, error: cfgWrite.error }), { status: 500, headers: jsonHeaders() });
       }
 
       // ── 保存 API key 到控制面板专属 .env.providers ────────────────────
-      const envUpdates = [];
-      (body.providers || []).forEach(p => {
-        if (!p.id) return;
-        // 本地模型（local-*）无需 API Key，跳过任何环境变量写入
-        if (String(p.id).indexOf("local-") === 0) return;
-        let envKey = PROVIDER_API_KEYS[p.id];
-        if (!envKey) {
-          envKey = customEnvKey(p.id);
-        }
-        let rawKey = null;
-        if (p._raw_api_key && !String(p._raw_api_key).startsWith('****')) {
-          rawKey = p._raw_api_key;
-        } else if (p.api_key && !String(p.api_key).startsWith('****') && p.api_key !== 'none') {
-          rawKey = p.api_key;
-        }
-        if (rawKey && rawKey.length > 0) {
-          envUpdates.push({ key: envKey, value: rawKey });
-        }
-      });
-      if (envUpdates.length > 0) {
-        try {
-          const envProvPath = `${VAR_DIR}/.env.providers`;
-          let envContent = existsSync(envProvPath) ? readFileSync(envProvPath, "utf8") : "";
-          envUpdates.forEach(({ key, value }) => {
-            const envRegex = new RegExp(`^${key}=.*$`, "m");
-            if (envRegex.test(envContent)) {
-              envContent = envContent.replace(envRegex, `${key}=${value}`);
-            } else {
-              envContent += `${key}=${value}\n`;
-            }
-          });
-          writeFileSync(envProvPath, envContent);
-        } catch (e) { /* 非致命错误 */ }
-      }
-
-      // ── 一次性迁移 .env.providers 旧格式 CUSTOM_PROVIDER_* → CUSTOM_* ──
-      try {
-        const _migPath = `${VAR_DIR}/.env.providers`;
-        if (existsSync(_migPath)) {
-          let _migContent = readFileSync(_migPath, "utf8");
-          const _migRe = /^CUSTOM_PROVIDER_([A-Z0-9_]+_API_KEY)=(.+)$/gm;
-          let _migM;
-          let _migDirty = false;
-          while ((_migM = _migRe.exec(_migContent)) !== null) {
-            const _nk = `CUSTOM_${_migM[1]}`;
-            if (!new RegExp(`^${_nk}=`, "m").test(_migContent)) {
-              _migContent += `${_nk}=${_migM[2]}\n`;
-            }
-            _migDirty = true;
-          }
-          if (_migDirty) {
-            _migContent = _migContent.split("\n").filter(l => !/^CUSTOM_PROVIDER_[A-Z0-9_]+_API_KEY=/.test(l)).join("\n");
-            writeFileSync(_migPath, _migContent);
-          }
-        }
-      } catch {}
+      saveProviderKeysToEnv(body.providers);
 
       // ── 设为默认时，同步 active provider 的 key 到 Hermes .env ──
+      syncActiveKeyToHermesEnv(providerId);
+
+      // ── 同步回退服务商 key 到 Hermes .env（缺失会导致回退触发时 401）──
       try {
-        const hermesEnvPath = `${DATA_DIR}/.env`;
-        let hermesEnv = existsSync(hermesEnvPath) ? readFileSync(hermesEnvPath, "utf8") : "";
-        // 从 envUpdates（或已有的 .env.providers）中找到 active provider 的 key
-        Object.keys(PROVIDER_API_KEYS).forEach(id => {
-          if (id !== providerId) return;
-          const envKey = PROVIDER_API_KEYS[id];
-          // 从 .env.providers 读取真实 key
-          const envProvPath = `${VAR_DIR}/.env.providers`;
-          if (existsSync(envProvPath)) {
-            const provEnv = readFileSync(envProvPath, "utf8");
-            const m = provEnv.match(new RegExp(`^${envKey}=(.*)$`, "m"));
-            if (m && m[1].length > 0) {
-              const hermesRegex = new RegExp(`^${envKey}=.*$`, "m");
-              if (hermesRegex.test(hermesEnv)) {
-                hermesEnv = hermesEnv.replace(hermesRegex, `${envKey}=${m[1]}`);
-              } else {
-                hermesEnv += `\n${envKey}=${m[1]}\n`;
-              }
-            }
-          }
-        });
-        // 同时检查自定义 provider
-        const _cKey = customEnvKey(providerId);
-        if (!PROVIDER_API_KEYS[providerId]) {
-          const envProvPath2 = `${VAR_DIR}/.env.providers`;
-          if (existsSync(envProvPath2)) {
-            const provEnv2 = readFileSync(envProvPath2, "utf8");
-            let m2 = provEnv2.match(new RegExp(`^${_cKey}=(.*)$`, "m"));
-            // 兼容旧名
-            if (!m2) m2 = provEnv2.match(new RegExp(`^${legacyCustomEnvKey(providerId)}=(.*)$`, "m"));
-            if (m2 && m2[1].length > 0) {
-              const hermesRegex2 = new RegExp(`^${_cKey}=.*$`, "m");
-              if (hermesRegex2.test(hermesEnv)) {
-                hermesEnv = hermesEnv.replace(hermesRegex2, `${_cKey}=${m2[1]}`);
-              } else {
-                hermesEnv += `\n${_cKey}=${m2[1]}\n`;
-              }
-            }
-          }
+        if (fallbackIds && fallbackIds.length > 0) {
+          syncFallbackKeysToHermesEnv(fallbackIds, `${VAR_DIR}/.env.providers`, `${DATA_DIR}/.env`);
         }
-        // 清理 Hermes .env 中旧格式 CUSTOM_PROVIDER_* 行
-        hermesEnv = hermesEnv.split("\n").filter(l => !/^CUSTOM_PROVIDER_[A-Z0-9_]+_API_KEY=/.test(l)).join("\n");
-        writeFileSync(hermesEnvPath, hermesEnv);
-      } catch (e) { /* 非致命错误 */ }
+      } catch (e) {}
 
       // ── 删除已移除 provider 的 .env.providers key ─────────────────────
-      try {
-        const envProvPath = `${VAR_DIR}/.env.providers`;
-        if (existsSync(envProvPath)) {
-          const envContent = readFileSync(envProvPath, "utf8");
-          const keepKeys = new Set();
-          (body.providers || []).forEach(p => {
-            if (!p.id) return;
-            const k = PROVIDER_API_KEYS[p.id] || customEnvKey(p.id);
-            keepKeys.add(k);
-          });
-          const lines = envContent.split("\n");
-          const filtered = lines.filter(line => {
-            const m = line.match(/^([A-Z_][A-Z0-9_]*API_KEY|.+_API_KEY)=/);
-            if (!m) return true;
-            return keepKeys.has(m[1]);
-          });
-          if (filtered.join("\n") !== envContent) {
-            writeFileSync(envProvPath, filtered.join("\n"));
-          }
-        }
-      } catch (e) { /* 非致命错误 */ }
+      cleanupRemovedProviderKeys(body.providers);
 
       // ── 同步 chat/config.json（保持向后兼容）────────────────────────────────
       try {
         const chatCfg = getChatConfig();
         chatCfg.active_provider = activeProv.name;
-        if (!chatCfg.providers.find(p => p.id === activeProv.id)) {
+        const existingChat = chatCfg.providers.find(p => p.id === activeProv.id);
+        if (!existingChat) {
           chatCfg.providers.unshift(activeProv);
+        } else {
+          // 已存在的条目也同步 model/temperature/max_tokens 等字段，
+          // 否则用户修改温度后 chatRequest 读到的仍是旧值
+          const norm = allProvConfig[providerId] || {};
+          if (activeProv.name) existingChat.name = activeProv.name;
+          if (norm.model || activeProv.model) existingChat.model = norm.model || activeProv.model;
+          if (norm.base_url || activeProv.base_url) existingChat.base_url = norm.base_url || activeProv.base_url;
+          const _t = norm.temperature != null ? norm.temperature : parseFloat(activeProv.temperature);
+          if (_t != null && !isNaN(_t)) existingChat.temperature = _t;
+          const _x = norm.max_tokens != null ? norm.max_tokens : parseInt(activeProv.max_tokens, 10);
+          if (_x != null && !isNaN(_x)) existingChat.max_tokens = _x;
         }
         saveChatConfig(chatCfg);
       } catch {}
 
       return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
     }
-
-  // ─── 主模型 API（读写 config.yaml 中的 model.provider + model.default） ──
-  if (path === "/api/config/primary-model" && req.method === "GET") {
-    const yamlPath = `${DATA_DIR}/config.yaml`;
-    let provider = "", model = "", providers = [];
-    try {
-      if (existsSync(yamlPath)) {
-        const yml = readFileSync(yamlPath, "utf8");
-        const provMatch = yml.match(/^model:[\s\S]*?\n\s+provider:\s*(\S+)/m);
-        const modelMatch = yml.match(/^model:[\s\S]*?\n\s+default:\s*(\S+)/m);
-        provider = provMatch ? provMatch[1] : "";
-        model    = modelMatch ? modelMatch[1] : "";
-
-        // 从 config.yaml 提取所有 provider（支持 inline {} 与多行两种格式）
-        // Inline 格式：providers: {minimax-cn: '****14fa', deepseek: '****f32e'}
-        // 使用能识别 key 的正则：以 "word:" 作为 key 边界
-        const inlinMatch = yml.match(/^providers:\s*\{(.+?)\}\s*$/m);
-        if (inlinMatch) {
-          const raw = inlinMatch[1];
-          // 在词+冒号序列（key 边界）之前的 ", " 处分割
-          const parts = raw.split(/, (?=\w+:)/);
-          parts.forEach(p => {
-            const colonIdx = p.indexOf(':');
-            if (colonIdx > 0) {
-              const k = p.slice(0, colonIdx).trim().replace(/['"]/g, '');
-              const v = p.slice(colonIdx + 1).trim().replace(/['"]/g, '');
-              const preset = PROVIDER_PRESETS[k];
-              const name = preset ? `${preset.name} (${k})` : k;
-              providers.push({ id: k, name, base_url: preset ? preset.base_url : "" });
-            }
-          });
-        } else {
-          // 多行格式：providers:\n  key: val\n  key: val
-          const multiMatch = yml.match(/^providers:\s*\n((?:  \S.*\n?)*)/m);
-          if (multiMatch) {
-            const lines = multiMatch[1].split("\n").filter(l => l.trim());
-            lines.forEach(line => {
-              const [k, v] = line.split(":").map(s => s.trim());
-              if (k && v) {
-                const preset = PROVIDER_PRESETS[k];
-                const name = preset ? `${preset.name} (${k})` : k;
-                providers.push({ id: k, name, base_url: preset ? preset.base_url : "" });
-              }
-            });
-          }
-        }
-      }
-    } catch {}
-    return new Response(JSON.stringify({ provider, model, providers }), { headers: jsonHeaders() });
-  }
-
-  if (path === "/api/config/primary-model" && req.method === "POST") {
-    const body = await req.json().catch(() => ({}));
-    const yamlPath = `${DATA_DIR}/config.yaml`;
-    let ymlContent = "";
-    try {
-      if (existsSync(yamlPath)) ymlContent = readFileSync(yamlPath, "utf8");
-    } catch {}
-    const newModelSection = `model:\n  provider: ${body.provider || ""}\n  default: ${body.model || ""}\n`;
-    if (ymlContent.match(/^model:/m)) {
-      ymlContent = ymlContent.replace(/^model:[\s\S]*?^(?=\S)/m, newModelSection);
-    } else {
-      ymlContent = newModelSection + ymlContent;
-    }
-    try {
-      writeFileSync(yamlPath, ymlContent);
-    } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 500, headers: jsonHeaders() });
-    }
-    return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
-  }
 
   if (path === "/api/config/test" && req.method === "POST") {
     const body = await req.json().catch(() => ({}));
@@ -3046,6 +3033,30 @@ async function handleFetch(req) {
     }
     const result = await fetchGatewayModels(provider);
     return new Response(JSON.stringify(result), { headers: jsonHeaders() });
+  }
+
+  // API 格式在线探测：后端代理探测 base_url，避免前端跨域（外接模块 api-format.js）
+  if (path === "/api/config/detect-format" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const baseUrl = String(body.base_url || "").trim();
+    if (!baseUrl) {
+      return new Response(JSON.stringify({ ok: false, error: "missing base_url" }), { status: 400, headers: jsonHeaders() });
+    }
+    // 掩码/缺省 key 时尝试从 .env.providers 解析真实 key（提升探测命中率，非必需）
+    let probeKey = String(body.api_key || "").trim();
+    if ((!probeKey || probeKey.startsWith("****") || probeKey === "****keep****") && body.id) {
+      try {
+        const realKey = resolveRealApiKey({ id: body.id, api_key: "" });
+        if (realKey) probeKey = realKey;
+      } catch { /* 探测可无 key 进行 */ }
+    }
+    const probed = await probeApiFormat(baseUrl, probeKey);
+    // 在线探测失败时降级返回启发式识别结果，保证按钮总有可用反馈
+    if (!probed.ok) {
+      const guessed = detectApiFormat(baseUrl, probeKey);
+      return new Response(JSON.stringify({ ok: false, error: probed.error, guess: guessed.format }), { headers: jsonHeaders() });
+    }
+    return new Response(JSON.stringify(probed), { headers: jsonHeaders() });
   }
 
   // ─── 聊天：模型 API ──────────────────────────────────────────────────────
@@ -3085,6 +3096,19 @@ async function handleFetch(req) {
       deleteSession(sid);
       return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
     }
+    if (req.method === "POST") {
+      // resume：把未完成的 _streaming checkpoint 消息转正（去掉标记保留内容），
+      // 避免上次崩溃/断电留下的半成品状态干扰继续对话
+      const s = getSession(sid);
+      if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: jsonHeaders() });
+      // 保护：会话正在运行（liveRun 未结束）时不转正，避免误伤流式中的 checkpoint
+      const _live = liveRuns.get(sid);
+      if (_live && !_live.done) {
+        return new Response(JSON.stringify({ ok: true, resumed: false, running: true, session: s }), { headers: jsonHeaders() });
+      }
+      const resumed = resumeStreamingMessages(s, saveSession);
+      return new Response(JSON.stringify({ ok: true, resumed, session: s }), { headers: jsonHeaders() });
+    }
     if (req.method === "PATCH") {
       const s = getSession(sid);
       if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: jsonHeaders() });
@@ -3097,6 +3121,51 @@ async function handleFetch(req) {
       } catch { return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: jsonHeaders() }); }
       return new Response(JSON.stringify({ ok: true, title: s.title }), { headers: jsonHeaders() });
     }
+  }
+
+  // ─── 多会话并发：运行表查询/恢复接口（供前端切窗口时调用）───────────
+  // 运行表快照：所有运行中/刚结束（TTL 内）的会话
+  if (path === "/api/chat/sessions/active" && req.method === "GET") {
+    const items = [];
+    for (const [sid, e] of liveRuns) {
+      items.push({
+        session_id: sid,
+        status: e.status,
+        started_at: e.started_at,
+        updated_at: e.updated_at,
+        output_len: e.output_base + e.output.length,
+        done: e.done,
+      });
+    }
+    return new Response(JSON.stringify(items), { headers: jsonHeaders() });
+  }
+
+  // 单会话运行态增量拉取：?cursor=N（输出文本绝对游标）&tool_cursor=M（工具事件绝对游标）
+  const liveMatch = path.match(/^\/api\/chat\/sessions\/([^/]+)\/live$/);
+  if (liveMatch && req.method === "GET") {
+    const sid = decodeURIComponent(liveMatch[1]);
+    const e = liveRuns.get(sid);
+    if (!e) {
+      // 不在运行表中（从未运行/已过 TTL 被清理）：历史内容请走现有会话接口
+      return new Response(JSON.stringify({ status: "idle" }), { headers: jsonHeaders() });
+    }
+    const cursor = Math.max(0, Number(url.searchParams.get("cursor")) || 0);
+    const toolCursor = Math.max(0, Number(url.searchParams.get("tool_cursor")) || 0);
+    // 游标早于缓存窗口（头部已被丢弃）时从窗口起点返回，truncated 提示前端有缺口
+    const truncated = cursor < e.output_base;
+    const outStart = Math.max(0, cursor - e.output_base);
+    const toolStart = Math.max(0, toolCursor - e.tool_base);
+    return new Response(JSON.stringify({
+      status: e.status,
+      output: e.output.slice(outStart),
+      cursor: e.output_base + e.output.length,
+      tool_events: e.tool_events.slice(toolStart),
+      tool_cursor: e.tool_base + e.tool_events.length,
+      done: e.done,
+      truncated,
+      started_at: e.started_at,
+      updated_at: e.updated_at,
+    }), { headers: jsonHeaders() });
   }
 
   // ─── Chat: WebSocket 消息队列（前端先 POST 消息入队，再建 WS 连接取流）──────
@@ -3139,13 +3208,25 @@ async function handleFetch(req) {
   // 普通网络抖动/断线不会再触发这里，只有真正点了停止才会中断模型调用。
   if (path === "/api/chat/stop" && req.method === "POST") {
     const body = await req.json().catch(() => ({}));
-    const ctrl = activeChatStreams.get(body.session_id);
-    if (ctrl) {
-      ctrl.abort();
-      activeChatStreams.delete(body.session_id);
-      return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders() });
+    if (body.session_id) {
+      // 按 session 隔离停止：只中断对应会话，其它并发会话不受影响
+      const ctrl = activeChatStreams.get(body.session_id);
+      if (ctrl) {
+        ctrl.abort();
+        activeChatStreams.delete(body.session_id);
+        return new Response(JSON.stringify({ ok: true, stopped: 1 }), { headers: jsonHeaders() });
+      }
+      return new Response(JSON.stringify({ ok: false, error: "no active stream for this session" }), { headers: jsonHeaders() });
     }
-    return new Response(JSON.stringify({ ok: false, error: "no active stream for this session" }), { headers: jsonHeaders() });
+    // 向后兼容：不带 session_id 时停止全部运行中的会话
+    let stopped = 0;
+    for (const [sid, ctrl] of activeChatStreams) {
+      try { ctrl.abort(); } catch {}
+      activeChatStreams.delete(sid);
+      stopped++;
+    }
+    if (stopped > 0) return new Response(JSON.stringify({ ok: true, stopped }), { headers: jsonHeaders() });
+    return new Response(JSON.stringify({ ok: false, error: "no active stream" }), { headers: jsonHeaders() });
   }
 
   // ─── 聊天：图片上传 API ─────────────────────────────────────────────────
@@ -3195,7 +3276,7 @@ async function handleFetch(req) {
         headers: jsonHeaders(),
       });
     }
-    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB（不再内联进 prompt，落盘即可，限制可以放宽）
+    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB（文件直接落盘、不内联进 prompt，限制可以放宽）
     try {
       const form = await req.formData();
       const file = form.get("file");
@@ -3225,17 +3306,7 @@ async function handleFetch(req) {
 
   // Dashboard 反代
   if (path.startsWith("/proxy/dashboard")) {
-    const subPath = path.replace(/^\/proxy\/dashboard/, "") || "/";
-    if (subPath.includes("..")) return new Response("Forbidden", { status: 403 });
-
-    // Dashboard 未运行时直接返回 503，不进入 proxy 避免打错误日志
-    if (!readPid(PID_DASHBOARD)) {
-      return new Response(JSON.stringify({ error: "Dashboard is not running" }), {
-        status: 503,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-    return proxyDashboard(req);
+    return handleDashboardHttp(req, path);
   }
 
   // 静态 UI — 根路径返回 index.html
@@ -3276,7 +3347,7 @@ async function handleFetch(req) {
     return serveFile(fp, ct);
   }
 
-  // 临时上传图片（遗留逻辑，从 TMP_DIR 提供，路径：/tmp/filename.ext）
+  // 临时上传图片（兼容路径 /tmp/filename.ext，从 TMP_DIR 提供）
   if (path.startsWith("/tmp/")) {
     const filename = path.slice(5); // 去掉 "/tmp/"
     if (filename.includes("..") || !filename) return new Response("Forbidden", { status: 403 });
@@ -3379,12 +3450,11 @@ process.on("unhandledRejection", (err) => {
 });
 
 // ─── 单实例保护：绑定 unix socket 前先探测是否已有存活实例 ─────────────
-// 之前的问题：serve() 对 unix socket 的 listen 是异步的，EADDRINUSE 只会以
-// uncaughtException 的形式在"Monitor ready"日志打印之后才出现——导致重复启动时
-// 出现两份完全相同的启动日志，其中一个进程实际上从未真正监听成功，却又不会退出，
-// 变成一个"看起来活着但什么也没做"的僵尸进程。这里改为：启动前主动探测 socket
-// 文件是否真的有进程在监听；如果有，直接退出，避免抢占；如果只是残留的旧文件
-//（上次进程被 kill -9 等方式非正常终止，没来得及清理），先删除再正常绑定。
+// serve() 对 unix socket 的 listen 是异步的，EADDRINUSE 只会以 uncaughtException
+// 的形式在"Monitor ready"日志打印之后才出现，无法同步发现重复启动。因此启动前
+// 主动探测 socket 文件是否真的有进程在监听：如果有，直接退出，避免抢占；如果
+// 只是残留的旧文件（上次进程被 kill -9 等方式非正常终止，没来得及清理），先删除
+// 再正常绑定。
 function checkSocketAlive(path) {
   return new Promise((resolve) => {
     const sock = net.connect(path);
@@ -3432,20 +3502,8 @@ serve({
       return; // 已升级
     }
     // Dashboard WebSocket 反代：/proxy/dashboard/api/(ws|events|pty)
-    if (wsPath.startsWith("/proxy/dashboard/api/ws") ||
-        wsPath.startsWith("/proxy/dashboard/api/events") ||
-        wsPath.startsWith("/proxy/dashboard/api/pty")) {
-      if (!readPid(PID_DASHBOARD)) {
-        return new Response(JSON.stringify({ error: "Dashboard is not running" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      const subPath = wsPath.replace(/^\/proxy\/dashboard/, "");
-      const targetUrl = `ws://${DASHBOARD_BIND}:${DASHBOARD_PORT}${subPath}${url.search}`;
-      const upgraded = server.upgrade(req, { data: { type: "dashboard-proxy", targetUrl } });
-      if (!upgraded) return new Response("WebSocket upgrade failed", { status: 500 });
-      return;
+    if (matchDashboardWsPath(wsPath)) {
+      return upgradeDashboardWs(req, server, wsPath, url);
     }
     return handleFetch(req);
   },

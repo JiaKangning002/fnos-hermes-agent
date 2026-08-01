@@ -1,5 +1,5 @@
 // provider-config.js — 供应商配置统一数据源
-// ── 供应商预设（18个）──────────────────────────────────────────────
+// ── 供应商预设 ──────────────────────────────────────────────
 export const PROVIDER_PRESETS = {
   "openai":          { name: "OpenAI",        base_url: "https://api.openai.com/v1" },
   "deepseek":        { name: "DeepSeek",       base_url: "https://api.deepseek.com" },
@@ -19,7 +19,7 @@ export const PROVIDER_PRESETS = {
   "ollama-cloud":    { name: "Ollama Cloud",   base_url: "https://ollama.com/v1" },
   "lmstudio":        { name: "LM Studio",      base_url: "http://localhost:1234/v1" },
   "alibaba":         { name: "通义千问",        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-  // ── Hermes 内置 api_key 类新增商（权威值取自 auth.py PROVIDER_REGISTRY） ──
+  // ── Hermes 内置 api_key 类供应商（权威值取自 auth.py PROVIDER_REGISTRY） ──
   "stepfun":             { name: "StepFun Step Plan",          base_url: "https://api.stepfun.ai/step_plan/v1" },
   "arcee":               { name: "Arcee AI",                   base_url: "https://api.arcee.ai/api/v1" },
   "gmi":                 { name: "GMI Cloud",                  base_url: "https://api.gmi-serving.com/v1" },
@@ -67,7 +67,7 @@ export const PROVIDER_MODELS = {
     "google/gemini-3.1-pro-preview", "deepseek/deepseek-v4-pro",
   ],
   "xai": [
-    // P3：清理 xAI 2026-05-15 已下线的 grok-4.1-fast 家族，补当前主力 grok-4.20。
+    // grok-4.1-fast 家族已于 2026-05-15 下线，此处仅保留当前在售型号
     "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning",
   ],
   "mistral": [
@@ -81,7 +81,7 @@ export const PROVIDER_MODELS = {
   "alibaba": [
     "qwen-plus", "qwen-max", "qwen3.5-plus", "qwen3-max-2026-01-23", "qwen3-coder-next",
   ],
-  // ── Hermes 内置 api_key 类新增商（模型取自 hermes_cli/models.py） ──
+  // ── Hermes 内置 api_key 类供应商（模型取自 hermes_cli/models.py） ──
   "stepfun": [
     "step-3.5-flash", "step-3.5-flash-2603",
   ],
@@ -116,17 +116,17 @@ export const PROVIDER_API_KEYS = {
   "mistral": "MISTRAL_API_KEY",     "nvidia": "NVIDIA_API_KEY",
   "huggingface": "HF_TOKEN",        "ollama-cloud": "OLLAMA_API_KEY",
   "ollama-local": "OLLAMA_LOCAL_API_KEY", "lmstudio": "LMSTUDIO_API_KEY", "alibaba": "DASHSCOPE_API_KEY",
-  // ── Hermes 内置 api_key 类新增商（主 env 取自 auth.py api_key_env_vars） ──
+  // ── Hermes 内置 api_key 类供应商（主环境变量名取自 auth.py api_key_env_vars） ──
   "stepfun": "STEPFUN_API_KEY",     "arcee": "ARCEEAI_API_KEY",
   "gmi": "GMI_API_KEY",             "kilocode": "KILOCODE_API_KEY",
   "alibaba-coding-plan": "ALIBABA_CODING_PLAN_API_KEY",
   "xiaomi": "XIAOMI_API_KEY",       "tencent-tokenhub": "TOKENHUB_API_KEY",
 };
 
-// ── A/B 分类（Sam 任务16 决策表）─────────────────────────────────────
+// ── A/B 分类 ─────────────────────────────────────
 // A 类：仅写 model 段，端点与原生协议交给 Hermes 内置 PROVIDER_REGISTRY 处理；
 // B 类：必须写 providers 段（base_url + api_key + default_model）。
-// 注：动态 id 约定 —— custom-*（第三方自定义商，写 providers 段含 api_key）、
+// 注：动态 id 约定 —— custom-*（第三方自定义服务商，写 providers 段含 api_key）、
 //     local-*（本地 OpenAI 兼容端点，写 providers 段仅 base_url + default_model，省略 api_key），
 //     二者均不在此表中，按“非预设”走 providers 段逻辑（详见 monitor.js customEntries）。
 export const PROVIDER_CLASSES = {
@@ -137,7 +137,7 @@ export const PROVIDER_CLASSES = {
   "huggingface": "A",    "lmstudio": "B",       "alibaba": "A",
   "siliconflow": "B",    "mistral": "B",        "ollama-cloud": "B",
   "ollama-local": "B",
-  // ── 新增商均为 Hermes 内置（A 类：只写 model 段、base_url 编辑框只读） ──
+  // ── 以下供应商均为 Hermes 内置（A 类：只写 model 段、base_url 编辑框只读） ──
   "stepfun": "A",        "arcee": "A",          "gmi": "A",
   "kilocode": "A",       "alibaba-coding-plan": "A",  "xiaomi": "A",
   "tencent-tokenhub": "A",

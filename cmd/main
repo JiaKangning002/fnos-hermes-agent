@@ -6,7 +6,7 @@
 # status: 查询进程状态
 #
 
-# 从环境变量或系统默认值获取路径（支持任意 volume：vol1, vol2, volx, etc.）
+# 从环境变量或系统默认值获取路径（支持任意 volume：vol1、vol2、volx 等）
 TRIM_APPDEST="${TRIM_APPDEST:-/vol1/@appcenter/hermes-agent}"
 TRIM_PKGHOME="${TRIM_PKGHOME:-/vol1/@apphome/hermes-agent}"
 TRIM_PKGVAR="${TRIM_PKGVAR:-/vol1/@appdata/hermes-agent}"

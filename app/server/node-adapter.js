@@ -1,8 +1,7 @@
 /**
  * Node.js 运行时适配层 — fnOS Hermes Agent
  *
- * 提供 Web API 风格的 serve / file / spawn / spawnSync / WebSocketClient，
- * 仅支持 Node.js（v22+），不再兼容 Bun。
+ * 提供 Web API 风格的 serve / file / spawn / spawnSync / WebSocketClient。
  */
 
 import { Readable } from "stream";
@@ -12,10 +11,10 @@ import * as http from "http";
 import { WebSocket as WsClient, WebSocketServer } from "./vendor/ws/wrapper.mjs";
 
 // ──────────────────────────────────────────────────────────────────────────
-// Global helpers
+// 全局日志工具
 // ──────────────────────────────────────────────────────────────────────────
 
-let globalLog = () => {}; // 默认空函数
+let globalLog = () => {};
 const log = (...args) => { try { globalLog(...args); } catch {} };
 
 export function setGlobalLogger(fn) {
@@ -47,7 +46,8 @@ function spawn(optsOrCmd) {
       stdin: proc.stdin,
       stdout: proc.stdout,
       stderr: proc.stderr,
-      exited: new Promise((resolve) => proc.on("exit", (code) => resolve(code))),
+      // error 事件（如可执行文件不存在）也要收尾 exited，否则未监听的 error 会直接崩进程
+      exited: new Promise((resolve) => { proc.on("exit", (code) => resolve(code)); proc.on("error", () => resolve(-1)); }),
       kill: (sig) => proc.kill(sig),
       unref: () => proc.unref(),
     };
@@ -77,7 +77,8 @@ function spawn(optsOrCmd) {
     stdin: proc.stdin,
     stdout: proc.stdout ? Readable.toWeb(proc.stdout) : null,
     stderr: proc.stderr ? Readable.toWeb(proc.stderr) : null,
-    exited: new Promise((resolve) => proc.on("exit", (code) => resolve(code))),
+    // error 事件（如可执行文件不存在）也要收尾 exited，否则未监听的 error 会直接崩进程
+    exited: new Promise((resolve) => { proc.on("exit", (code) => resolve(code)); proc.on("error", () => resolve(-1)); }),
     kill: (sig) => proc.kill(sig),
     unref: () => proc.unref(),
   };
@@ -142,7 +143,8 @@ function serve(config) {
     }
 
     ws.on("message", (data, isBinary) => {
-      const msg = isBinary ? data.toString() : data;
+      // 二进制帧保持 Buffer，文本帧转为 string，避免下游误判帧类型
+      const msg = isBinary ? data : data.toString();
       if (handler.message) handler.message(ws, msg);
     });
 
@@ -195,7 +197,7 @@ function serve(config) {
         pathname.startsWith("/proxy/dashboard/api/events") ||
         pathname.startsWith("/proxy/dashboard/api/pty")) {
       if (!data) {
-        // 不再伪造 targetUrl: null 去创建一个注定会崩溃的连接——
+        // 此时没有代理目标，不能拿 targetUrl: null 去创建注定会崩溃的连接——
         // 走到这里通常意味着 config.fetch() 里判定 dashboard 未运行、
         // 鉴权失败等，直接以正常的 WS 关闭码拒绝升级即可
         log(`[WS-PROXY] No upgrade data for ${pathname}, rejecting upgrade`);
@@ -275,7 +277,7 @@ function serve(config) {
 const WebSocketClient = WsClient;
 
 // ──────────────────────────────────────────────────────────────────────────
-// Exports
+// 导出
 // ──────────────────────────────────────────────────────────────────────────
 
 export { serve, file, spawn, spawnSync, WebSocketClient };
