@@ -240,13 +240,35 @@ async function proxyDashboard(req) {
     if (contentType.includes("text/html")) {
       let html = await upstream.text();
 
-      // <base> 处理相对路径（CSS url()、相对 src 等）
-      html = html.replace(/<head(\s[^>]*)?>/, `<head$1><base href="${prefix}/">`);
+      // <base> 处理相对路径（CSS url()、相对 src 等）—— 多模式兼容
+      if (!/<base\s[^>]*>/i.test(html)) {
+        // 尝试：<head attr="value"> / <head/> / <head \n...>
+        const headMatch = html.match(/<head(?:\s[^>]*)?>/i);
+        if (headMatch) {
+          const endIdx = headMatch.index + headMatch[0].length;
+          html = html.slice(0, endIdx) + `<base href="${prefix}/">` + html.slice(endIdx);
+        } else {
+          // 兜底：在最接近开头的位置插入
+          const htmlIdx = html.indexOf('<html');
+          const idx = htmlIdx !== -1 ? htmlIdx : 0;
+          const baseTag = `<base href="${prefix}/">`;
+          if (idx === -1) {
+            html = baseTag + html;
+          } else {
+            html = html.slice(0, idx) + `<div>${baseTag}</div>` + html.slice(idx);
+          }
+        }
+      }
 
       // 静态重写 src 属性中的绝对路径（脚本、图片等）
       html = html.replace(/\bsrc="\/(?!\/)/g, `src="${prefix}/`);
       // 静态重写 <link href>（CSS 样式表），不改写 <a href>（SPA 路由需要原始路径）
       html = html.replace(/<link(\s[^>]*)href="\/(?!\/)/g, (m, a) => `<link${a}href="${prefix}/`);
+      
+      // 额外补漏：把模块 preload links 也加前缀（上游很多 modulepreload）
+      // ⚠️ 只改写 /assets/开头的，避免重复加前缀（<base>已生效时会自动解析相对路径）
+      html = html.replace(/<link(\s[^>]*)rel="modulepreload"(\s[^>]*)href="\/assets\//g,
+        (match, before, after) => `<link${before}rel="modulepreload"${after}href="${prefix}/assets/`);
 
       // 注入 CSS：小屏 UI 修正（只在代理层注入覆盖，不改上游 Dashboard 本体）
       //   1. 侧边栏浮层背景：<1024px(lg) 时 #app-sidebar 是 fixed 浮层，上游内联 style 的
@@ -301,7 +323,7 @@ async function proxyDashboard(req) {
   min-height: 2.5rem !important;
   padding: 0.625em 1em !important;
 }
-`,</style>`;
+</style>`;
 
       // 注入 JS：智能前缀管理（pushState剥离+导航感知恢复+popstate拦截）
       const inject = `<script>
@@ -585,6 +607,21 @@ function classifyClose(code) {
   return "backoff-reconnect";
 }
 
+// ─── /api/ws 控制通道「秒关重连风暴」诊断（仅观测，不改变任何反代行为）───
+// 单窗口下上游常以 code=1000 秒关控制通道，官方 SPA 随即无限重连直至卡死。
+// 现有日志看不出单连接存活时长与单位时间重连频次，此处补齐这两项确证数据。
+const CTRL_WS_DIAG_WINDOW_MS = 10000;   // 重连次数统计的滚动窗口
+const CTRL_WS_SHORT_LIFE_MS = 2000;     // 判定「秒关」的存活时长阈值
+const ctrlWsRecentCloses = [];          // 近期秒关时刻（毫秒时间戳），仅诊断用
+
+// token 脱敏：仅保留首尾各若干位，避免诊断日志泄露完整凭证
+function maskToken(token) {
+  if (!token) return "none";
+  const s = String(token);
+  if (s.length <= 8) return s.slice(0, 2) + "…";
+  return s.slice(0, 4) + "…" + s.slice(-4);
+}
+
 function wrapDashboardProxy(ws, upstreamFactory, opts = {}) {
   const {
     log = () => {},
@@ -605,6 +642,22 @@ function wrapDashboardProxy(ws, upstreamFactory, opts = {}) {
   };
   let clientPingTimer = null, clientPongTimer = null, reconnectTimer = null;
   let clearUpstreamTimers = () => {};
+
+  // ── /api/ws 控制通道诊断上下文（仅观测）──
+  // openTs 记录本连接首次建立时刻，供上游秒关时计算存活时长；
+  // ctrlWsDiag 仅在控制通道 /api/ws 时非空，避免污染 /api/events、/api/pty 日志。
+  const openTs = Date.now();
+  let ctrlWsDiag = null;
+  try {
+    const tu = new URL(ws.data && ws.data.targetUrl);
+    if (tu.pathname.startsWith("/api/ws")) {
+      ctrlWsDiag = {
+        path: tu.pathname,
+        token: tu.searchParams.get("token"),
+        channel: tu.searchParams.get("channel"),
+      };
+    }
+  } catch {}
 
   // 终止整条链路：清定时器、清队列、关掉真实上游（幂等）
   function shutdown() {
@@ -717,6 +770,23 @@ function wrapDashboardProxy(ws, upstreamFactory, opts = {}) {
       const reason = event && event.reason;
       const decision = classifyClose(code);
       log(`[WS-PROXY] upstream closed code=${code} → ${decision}`);
+      // ── /api/ws 控制通道秒关诊断（仅观测，不影响下方关闭/重连决策）──
+      // 上游以 code=1000 关闭且本连接存活不足阈值时，输出确证数据：脱敏 token、
+      // 请求 path（带 channel 参数时一并记录）、首次 open 时刻、关闭码与原因、
+      // 存活毫秒数，并附带近 10 秒滚动窗口内的秒关重连次数。
+      if (ctrlWsDiag && code === 1000) {
+        const aliveMs = Date.now() - openTs;
+        if (aliveMs < CTRL_WS_SHORT_LIFE_MS) {
+          const now = Date.now();
+          ctrlWsRecentCloses.push(now);
+          // 裁剪窗口外的历史项，避免数组无限增长
+          while (ctrlWsRecentCloses.length && now - ctrlWsRecentCloses[0] > CTRL_WS_DIAG_WINDOW_MS) {
+            ctrlWsRecentCloses.shift();
+          }
+          const chan = ctrlWsDiag.channel ? ` channel=${ctrlWsDiag.channel}` : "";
+          log(`[WS-PROXY][diag] /api/ws 秒关 token=${maskToken(ctrlWsDiag.token)} path=${ctrlWsDiag.path}${chan} openAt=${new Date(openTs).toISOString()} code=${code} reason=${reason || ""} alive=${aliveMs}ms 近10s重连${ctrlWsRecentCloses.length}次`);
+        }
+      }
       if (decision === "passthrough") {
         try { ws.close(code, reason); } catch {}
         shutdown();

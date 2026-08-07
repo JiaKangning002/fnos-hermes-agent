@@ -1,5 +1,6 @@
 // Hermes Agent 监控服务 — Node.js HTTP 服务（Unix Socket）
-import { serve, file, spawn } from "./node-adapter.js";
+// serve() 的调用已移交 boot.js，本模块仅导出 handleServe/websocket 处理器，故不再引入 serve。
+import { file, spawn } from "./node-adapter.js";
 import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync, statSync, symlinkSync, watch, chmodSync, readdirSync } from "fs";
 import { randomBytes } from "crypto";
 import { networkInterfaces } from "os";
@@ -14,12 +15,18 @@ import { detectApiFormat, probeApiFormat, apiModeForFormat, normalizeApiFormat }
 import { initDashboard, DEFAULT_DASHBOARD_PORT, ALTERNATE_DASHBOARD_PORT, spawnDashboard, handleDashboardStart, handleDashboardStop, checkDashboardHealth, handleDashboardHttp, matchDashboardWsPath, upgradeDashboardWs, handleDashboardWsOpen, handleDashboardWsMessage, handleDashboardWsClose } from "./dashboard.js";
 import { initPrimaryConfig, resolveRealApiKey, loadProvidersState, writeProvidersState, writeConfigYaml, saveProviderKeysToEnv, syncActiveKeyToHermesEnv, cleanupRemovedProviderKeys, resolveBridgePrimary } from "./primary-config.js";
 import { createBridgeKeeper } from "./bridge-keeper.js";
-import { createUpdateChecker } from "./update-check.js";
+import { createUpdateChecker, compareVersions } from "./update-check.js";
+import { fileURLToPath } from "url";
+import pathModule from "path";
 
 // 动态检测当前运行路径 - 完全不使用硬编码的盘符或路径
 const ENV_APP_DIR   = process.env.APP_DIR;
 const ENV_DATA_DIR  = process.env.DATA_DIR;
 const ENV_VAR_DIR   = process.env.VAR_DIR;
+
+// ESM: import.meta.url → __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = pathModule.dirname(__filename);
 
 let APP_DIR;
 
@@ -44,10 +51,9 @@ if (ENV_APP_DIR) {
     APP_DIR = process.env.APP_DIR || "/vol1/@appcenter/hermes-agent";
   }
 }
-
 const DATA_DIR = ENV_DATA_DIR || `${APP_DIR}/data`;
 const VAR_DIR = ENV_VAR_DIR || `${APP_DIR}/var`;
-const LOG_FILE       = `${VAR_DIR}/hermes.log`;
+const LOG_FILE       = `${VAR_DIR}/monitor.log`; // Monitor 自身日志（原 hermes.log，更名以便理解）
 const PID_GATEWAY    = `${VAR_DIR}/gateway.pid`;
 const PID_DASHBOARD  = `${VAR_DIR}/dashboard.pid`;
 const TOKEN_FILE     = `${VAR_DIR}/monitor.token`;
@@ -279,13 +285,20 @@ function runCmdAsync(cmd, args, timeoutMs) {
 function formatHermesVersion(raw) {
   if (!raw) return "unknown";
   const verMatch = raw.match(/(\d+\.\d+\.\d+)/);
-  const dateMatch = raw.match(/(\d{4})[-.\/](\d{1,2})[-.\/](\d{1,2})/);
+  // 尝试匹配多种日期格式：vYYYY.M.D、YYYY-M-D、YYYY.M.D
+  const dateMatch = raw.match(/(?:v)?(\d{4})[-./](\d{1,2})[-./](\d{1,2})/);
+  
   if (!verMatch) return raw.trim().split("\n")[0].slice(0, 64) || "unknown";
+  
   let out = `v${verMatch[1]}`;
+  
   if (dateMatch) {
+    // 检查日期是否已经以 v 开头（如 v2026.8.3 -> v2026.8.3 应该变成 (2026.8.3)）
     const y = dateMatch[1], m = Number(dateMatch[2]), d = Number(dateMatch[3]);
+    // 格式化日期为 YYYY.MM.DD
     out += ` (${y}.${m}.${d})`;
   }
+  
   return out;
 }
 let HERMES_VERSION = "unknown";
@@ -301,98 +314,104 @@ if (!existsSync(HERMES_BIN_PATH)) {
     }
   } catch {}
 }
+// 版本检测逻辑（带异常处理）
 try {
   // 优先读缓存文件（瞬间完成），让服务器尽快启动
   if (existsSync(VERSION_FILE)) {
     const cached = readFileSync(VERSION_FILE, "utf8").trim();
     if (cached) HERMES_VERSION = cached;
   }
-// 缓存没有时才执行 hermes --version（可能耗时数秒）
-if (HERMES_VERSION === "unknown") {
-  log(`[版本检测] 尝试从 hermes 二进制获取版本号：${HERMES_BIN_PATH}`);
   
-  // 尝试 1: 标准方式；限 15 秒：此处在服务监听前同步执行，子进程挂起会无限期推迟服务启动
-  const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], { 
-    stdout: "pipe", 
-    stderr: "pipe",
-    timeout: 15000,
-    killSignal: "SIGKILL"
-  });
-  
-  let verOut = "";
-  log(`[版本检测] exitCode=${verResult.status}, hasStdout=${!!verResult.stdout}, hasStderr=${!!verResult.stderr}`);
-  
-  if (verResult.stdout) {
-    try {
-      verOut = verResult.stdout.toString("utf8").trim();
-      log(`[版本检测] stdout: ${verOut ? `"${verOut}"` : "(empty)"}`);
-    } catch (e) {
-      log(`[版本检测] stdout 解码失败：${e.message}`);
-    }
-  }
-  
-  if (!verOut && verResult.stderr) {
-    try {
-      verOut = verResult.stderr.toString("utf8").trim();
-      log(`[版本检测] stderr: ${verOut ? `"${verOut}"` : "(empty)"}`);
-    } catch (e) {
-      log(`[版本检测] stderr 解码失败：${e.message}`);
-    }
-  }
-  
-  // 尝试 2: 如果 standard way 不行，试试直接运行不加参数
-  if (!verOut) {
-    log(`[版本检测] 标准方式失败，尝试备选方案...`);
+  // 缓存没有时才执行 hermes --version（可能耗时数秒）
+  if (HERMES_VERSION === "unknown") {
+    log(`[版本检测] 尝试从 hermes 二进制获取版本号：${HERMES_BIN_PATH}`);
     
-    // 检查是否是 shebang 问题
-    let firstLine = "";
-    try {
-      if (existsSync(HERMES_BIN_PATH)) {
-        const fs = require('fs');
-        const fileStream = fs.createReadStream(HERMES_BIN_PATH, { autoClose: true });
-        const reader = require('stream').Readable.from(fileStream);
-        const chunks = [];
-        for await (const chunk of reader) chunks.push(chunk);
-        if (chunks.length > 0) {
-          firstLine = Buffer.concat(chunks).toString('utf8').split('\n')[0];
-          log(`[版本检测] 文件第一行：${firstLine.substring(0, 50)}...`);
+    // 尝试 1: 标准方式；限 15 秒：此处在服务监听前同步执行，子进程挂起会无限期推迟服务启动
+    const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], { 
+      stdout: "pipe", 
+      stderr: "pipe",
+      timeout: 15000,
+      killSignal: "SIGKILL"
+    });
+    
+    let verOut = "";
+    log(`[版本检测] exitCode=${verResult.status}, hasStdout=${!!verResult.stdout}, hasStderr=${!!verResult.stderr}`);
+    
+    if (verResult.stdout) {
+      try {
+        verOut = verResult.stdout.toString("utf8").trim();
+        log(`[版本检测] stdout: ${verOut ? `"${verOut}"` : "(empty)"}`);
+      } catch (e) {
+        log(`[版本检测] stdout 解码失败：${e.message}`);
+      }
+    }
+    
+    if (!verOut && verResult.stderr) {
+      try {
+        verOut = verResult.stderr.toString("utf8").trim();
+        log(`[版本检测] stderr: ${verOut ? `"${verOut}"` : "(empty)"}`);
+      } catch (e) {
+        log(`[版本检测] stderr 解码失败：${e.message}`);
+      }
+    }
+    
+    // 尝试 2: 如果 standard way 不行，试试直接运行不加参数
+    if (!verOut) {
+      log(`[版本检测] 标准方式失败，尝试备选方案...`);
+      
+      // 检查是否是 shebang 问题
+      let firstLine = "";
+      try {
+        if (existsSync(HERMES_BIN_PATH)) {
+          const fs = require('fs');
+          const fileStream = fs.createReadStream(HERMES_BIN_PATH, { autoClose: true });
+          const reader = require('stream').Readable.from(fileStream);
+          const chunks = [];
+          for await (const chunk of reader) chunks.push(chunk);
+          if (chunks.length > 0) {
+            firstLine = Buffer.concat(chunks).toString('utf8').split('\n')[0];
+            log(`[版本检测] 文件第一行：${firstLine.substring(0, 50)}...`);
+          }
+        }
+      } catch (e) {
+        log(`[版本检测] 读取文件第一行失败：${e.message}`);
+      }
+      
+      // 如果是 Python 脚本，直接用 python3 运行
+      if (firstLine.includes('python') || firstLine.includes('#!')) {
+        log(`[版本检测] 检测到 shebang，使用 Python 运行`);
+        // 限 15 秒：同上，避免备选探测无限期阻塞启动
+        const pyResult = spawnSync("python3", [HERMES_BIN_PATH, "--version"], {
+          stdout: "pipe",
+          stderr: "pipe",
+          timeout: 15000,
+          killSignal: "SIGKILL"
+        });
+        
+        if (pyResult.stdout) {
+          verOut = pyResult.stdout.toString("utf8").trim();
+          log(`[版本检测] Python3 方式输出：${verOut ? `"${verOut}"` : "(empty)"}`);
         }
       }
-    } catch (e) {
-      log(`[版本检测] 读取文件第一行失败：${e.message}`);
     }
     
-    // 如果是 Python 脚本，直接用 python3 运行
-    if (firstLine.includes('python') || firstLine.includes('#!')) {
-      log(`[版本检测] 检测到 shebang，使用 Python 运行`);
-      // 限 15 秒：同上，避免备选探测无限期阻塞启动
-      const pyResult = spawnSync("python3", [HERMES_BIN_PATH, "--version"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 15000,
-        killSignal: "SIGKILL"
-      });
-      
-      if (pyResult.stdout) {
-        verOut = pyResult.stdout.toString("utf8").trim();
-        log(`[版本检测] Python3 方式输出：${verOut ? `"${verOut}"` : "(empty)"}`);
-      }
+    if (verOut) {
+      log(`[版本检测] 原始版本字符串：${JSON.stringify(verOut)}`);
+      HERMES_VERSION = formatHermesVersion(verOut);
+      try { writeFileSync(VERSION_FILE, HERMES_VERSION, { mode: 0o644 }); } catch {}
+      log(`[版本检测] 成功解析版本：${HERMES_VERSION}`);
+    } else {
+      log(`[版本检测] hermes --version 所有方式都失败`);
     }
   }
-  
-  if (verOut) {
-    HERMES_VERSION = formatHermesVersion(verOut);
-    try { writeFileSync(VERSION_FILE, HERMES_VERSION, { mode: 0o644 }); } catch {}
-    log(`[版本检测] 成功解析版本：${HERMES_VERSION}`);
-  } else {
-    log(`[版本检测] hermes --version 所有方式都失败`);
-  }
+} catch (e) {
+  log(`[版本检测] 版本探测异常：${e.message}`);
 }
-  // 后台异步刷新版本（解决升级后缓存文件仍是旧版本号的问题）。
-  // 必须走异步执行：此定时器在服务开始监听后触发，同步子进程一旦挂起会冻结事件循环，
-  // 导致首屏 index.html 等全部请求被拖住直至子进程退出（#141 白屏根因）。
-  setTimeout(() => {
-    runCmdAsync(HERMES_BIN_PATH, ["--version"], 15000).then((r) => {
+// 必须走异步执行：此定时器在服务开始监听后触发，同步子进程一旦挂起会冻结事件循环，
+// 导致首屏 index.html 等全部请求被拖住直至子进程退出（#141 白屏根因）。
+process.nextTick(() => {
+  log(`[版本检测] 准备刷新缓存 (当前=${HERMES_VERSION}, 文件=${VERSION_FILE})`);
+  runCmdAsync(HERMES_BIN_PATH, ["--version"], 15000).then((r) => {
       const out = r.stdout || r.stderr;
       if (out) {
         const realVer = formatHermesVersion(out);
@@ -407,20 +426,9 @@ if (HERMES_VERSION === "unknown") {
         log(`[版本检测] 后台刷新执行失败: ${r.error.message}`);
       }
     }).catch((e) => {
-      log(`[版本检测] 后台刷新异常: ${e.message}`);
+      log(`[版本检测] 后台刷新异常：${e.message}`);
     });
-  }, 3000);
-} catch (e) {
-  log(`[版本检测] 版本探测流程异常: ${e.message}`);
-  try {
-    if (existsSync(VERSION_FILE)) {
-      const cached = readFileSync(VERSION_FILE, "utf8").trim();
-      if (cached) HERMES_VERSION = cached;
-    }
-  } catch (e2) {
-    log(`[版本检测] 读取缓存文件也失败: ${e2.message}`);
-  }
-}
+});
 log(`[启动检测] Hermes Agent 版本: ${HERMES_VERSION}`);
 
 // ─── 启动令牌（写入 VAR_DIR 供本机 CLI/脚本读取）────────────────────────────
@@ -1270,11 +1278,12 @@ const liveRuns = new Map();
 
 // 新建运行条目，返回 monitor 级 run_id（与 bridge 内部 run_id 无关）。
 // 同 session 新运行接管时直接覆盖旧条目；旧运行的后续回调因 run_id 不匹配而被忽略
-function liveRunStart(sessionId) {
+function liveRunStart(sessionId, prompt) {
   const runId = randomBytes(8).toString("hex");
   liveRuns.set(sessionId, {
     run_id: runId,
     status: "running",       // running | complete | interrupted | error
+    prompt: prompt != null ? prompt : "",  // 本轮用户提问（与助手输出同源，供跨窗口流转时渲染当前问题）
     output: "",
     output_base: 0,          // 被丢弃的头部字符数（绝对游标 = output_base + output.length）
     tool_events: [],
@@ -1389,7 +1398,7 @@ function createChatStream(sessionId, message, reqSignal) {
         }
 
         // 登记并发运行表（覆盖 bridge 与 HTTP SSE 降级两条链路）
-        liveRunId = liveRunStart(sessionId);
+        liveRunId = liveRunStart(sessionId, message);
 
         // 去重：WS 路径（runChatWS）可能在 XHR 回退前已推送过该用户消息
         const _lastMsg = session.messages[session.messages.length - 1];
@@ -1588,7 +1597,7 @@ async function runChatWS(ws, sessionId, message) {
     if (!session) { sendJSON({ error: "session not found" }); sendJSON({ done: true }); cleanup(); return; }
 
     // 登记并发运行表（覆盖 bridge 与 HTTP SSE 降级两条链路）
-    liveRunId = liveRunStart(sessionId);
+    liveRunId = liveRunStart(sessionId, message);
 
     // 去重：防止边界情况（如并发调用）下出现重复用户消息
     const _wsLastMsg = session.messages[session.messages.length - 1];
@@ -1993,6 +2002,23 @@ function spawnHermes(name, pidPath, args) {
     REQUEST_TIMEOUT:    "600",
   };
 
+  if (name === "dashboard") {
+    // 预构建前端随包分发（app/hermes-web-dist），显式指定 HERMES_WEB_DIST 后
+    // dashboard 跳过运行时 npm 构建直接 serve 静态产物（上游 main.py/web_server.py
+    // 均原生支持该变量）。优先级：hermes-repo 现场构建产物（版本严格匹配）→
+    // 随包兜底产物（更新流程 npm 构建失败时仍可出页面，不再白屏 404）。
+    const repoDist = `${DATA_DIR}/hermes-repo/hermes_cli/web_dist`;
+    const pkgDist  = `${__dirname}/../hermes-web-dist`;
+    const distDir = existsSync(`${repoDist}/index.html`) ? repoDist
+                  : existsSync(`${pkgDist}/index.html`)  ? pkgDist : null;
+    if (distDir) {
+      env.HERMES_WEB_DIST = distDir;
+      log(`dashboard HERMES_WEB_DIST=${distDir}`);
+    } else {
+      log(`dashboard 未找到可用 web dist（repo 与随包均缺失），将依赖上游运行时构建`);
+    }
+  }
+
   const p = spawn({
     cmd:    [HERMES_BIN, ...args],
     env,
@@ -2246,8 +2272,8 @@ bridgeKeeper = createBridgeKeeper({
 });
 bridgeKeeper.startHealthLoop();
 
-// 应用包版本更新检查器（/api/update/check 用，内置 1 小时缓存）
-const appUpdateChecker = createUpdateChecker({ appDir: APP_DIR, log });
+// 应用包版本更新检查器（/api/update/check 用，实时查询 GitHub，仅失败态短缓存）
+const appUpdateChecker = createUpdateChecker({ appDir: APP_DIR, log, cacheFile: `${VAR_DIR}/update-latest.txt` });
 
 // ─── 请求处理器 ─────────────────────────────────────────────────────────
 async function handleFetch(req) {
@@ -2321,7 +2347,7 @@ async function handleFetch(req) {
     const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
     const logDir = `${DATA_DIR}/logs`;
     const logFiles = [
-      { name: "hermes.log",             label: "Monitor 日志" },
+      { name: "monitor.log",             label: "Monitor 日志" },
       { name: "agent.log",              label: "Agent 日志" },
       { name: "gui.log",                label: "GUI 日志" },
       { name: "errors.log",             label: "错误日志" },
@@ -2356,10 +2382,12 @@ async function handleFetch(req) {
     }), { headers: jsonHeaders() });
   }
 
-  // ── 应用包版本更新检查（模块内含缓存与失败降级，绝不 500）──
+  // ── 应用包版本更新检查（模块内实时查询 + 失败短缓存，绝不 500）──
+  // force=1 时连失败缓存也绕过，强制从 GitHub 获取最新发布
   if (path === "/api/update/check") {
-    const payload = await appUpdateChecker.check();
-    return new Response(JSON.stringify(payload), { headers: jsonHeaders() });
+    const force = url.searchParams.get("force") === "1";
+    const payload = await appUpdateChecker.check({ force });
+    return new Response(JSON.stringify(payload), { headers: { ...jsonHeaders(), "Cache-Control": "no-store" } });
   }
 
   // ── Hermes 自更新（直接使用 uv，不依赖 dashboard）────────
@@ -2390,49 +2418,76 @@ async function handleFetch(req) {
         log(`[更新检查] 版本探测异常: ${e.message}`);
       }
       const currentVer = current.replace(/^v/, "").split(" ")[0];
-      let latest = "unknown";
-      let latestDate = "";
 
-      // 优先 PyPI JSON API（可获取发布日期）
+      // 通过 GitHub Releases API 检查是否有更新
+      let updateAvailable = false;
+      let latestDisplay = current; // 默认与当前版本相同
+
       try {
-        const r = await fetch("https://pypi.org/pypi/hermes-agent/json", {
-          signal: AbortSignal.timeout(10000),
+        const res = await fetch('https://api.github.com/repos/NousResearch/hermes-agent/releases/latest', {
+          headers: {
+            'User-Agent': 'fnos-hermes-agent/0.19.0',
+          },
         });
-        if (r.ok) {
-          const data = await r.json();
-          if (data.info && data.info.version) {
-            latest = data.info.version;
-            const rels = data.releases && data.releases[latest];
-            if (rels && rels.length > 0 && rels[0].upload_time) {
-              const d = new Date(rels[0].upload_time);
-              latestDate = `(${d.getFullYear()}.${d.getMonth() + 1}.${d.getDate()})`;
+        if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
+        const data = await res.json();
+        
+        // 优先从 release name 解析语义版本号（如"Hermes Agent v0.20.0 (2026.8.3)" → "0.20.0"），
+        // 其次 fallback 到 body，最后才用 tag_name（通常是日期格式）
+        const semVerRe = /v?(\d+\.\d+\.\d+)/;
+        let realVer = null;
+        if (data.name) {
+          const m = String(data.name).match(semVerRe);
+          if (m && m[1]) { realVer = m[1]; }
+        }
+        if (!realVer && data.body) {
+          const m = String(data.body).match(semVerRe);
+          if (m && m[1]) { realVer = m[1]; }
+        }
+        if (!realVer) {
+          const tag = String((data.tag_name||'').replace(/^v/, ''));
+          if (/^\d+\.\d+\.\d+$/.test(tag)) { realVer = tag; }
+        }
+        
+        if (!realVer) {
+          log(`[更新检查] GitHub 返回无有效语义版本：name=${String(data.name||'')}, tag=${String(data.tag_name||'')}`);
+          updateAvailable = false;
+          latestDisplay = current;
+        } else {
+          const curVerNum = current.replace(/^v/, '').split(/[^\d.]/)[0];
+          log(`[更新检查] GitHub realVersion=v${realVer}, current=${curVerNum}`);
+          const cmp = compareVersions(realVer, curVerNum);
+                  
+          // 解析发布日期：优先从 tag_name (v2026.8.3) 取，fallback 到 published_at
+          let dateStr = '';
+          const tagDateMatch = String(data.tag_name || '').replace(/^v/, '').match(/^(\d{4})[-.](\d{1,2})[-.](\d{1,2})/);
+          if (tagDateMatch) {
+            dateStr = `${tagDateMatch[1]}.${tagDateMatch[2]}.${tagDateMatch[3]}`;
+          } else {
+            const pubAt = String(data.published_at || '');
+            const d = new Date(pubAt);
+            if (!isNaN(d.getTime())) {
+              const mm = [d.getMonth()+1, d.getDate()].map(n => n.toString().padStart(2,'0'));
+              dateStr = `${d.getFullYear()}.${mm[0]}.${mm[1]}`;
             }
           }
-        }
-      } catch {}
-
-      // 兜底：阿里云镜像 simple index（无日期信息）
-      if (latest === "unknown") {
-        try {
-          const r2 = await fetch("https://mirrors.aliyun.com/pypi/simple/hermes-agent/", {
-            signal: AbortSignal.timeout(10000),
-          });
-          const html = await r2.text();
-          const versions = [...html.matchAll(/hermes-agent-(\d+\.\d+\.\d+)/g)].map(m => m[1]);
-          if (versions.length > 0) {
-            versions.sort((a, b) => {
-              const pa = a.split(".").map(Number);
-              const pb = b.split(".").map(Number);
-              for (let i = 0; i < 3; i++) { if (pa[i] !== pb[i]) return pa[i] - pb[i]; }
-              return 0;
-            });
-            latest = versions[versions.length - 1];
+                  
+          if (cmp > 0) {
+            updateAvailable = true;
+            latestDisplay = dateStr ? `v${realVer} (${dateStr})` : `v${realVer}`;
+            log(`[更新检查] 新版本：${latestDisplay} > ${curVerNum}`);
+          } else {
+            updateAvailable = false;
+            latestDisplay = dateStr ? `v${realVer} (${dateStr})` : `v${realVer}`;
+            log(`[更新检查] 已是最新：${latestDisplay} <= ${curVerNum}`);
           }
-        } catch {}
+        }
+      } catch (e) {
+        log(`[更新检查] GitHub API 失败：${e.message}`);
+        updateAvailable = false;
+        latestDisplay = current;
       }
-
-      const latestDisplay = latest !== "unknown" ? `v${latest} ${latestDate}`.trim() : "未知";
-      const updateAvailable = latest !== "unknown" && latest !== currentVer;
+      log(`[更新检查] 最终结果：current=${current}, latest=${latestDisplay}, available=${updateAvailable}`);
       return new Response(JSON.stringify({ current, latest: latestDisplay, updateAvailable }), {
         headers: { "Content-Type": "application/json" },
       });
@@ -2444,35 +2499,91 @@ async function handleFetch(req) {
   }
 
   if (path === "/api/hermes/update" && req.method === "POST") {
+    // ===== 更新逻辑（根据调研结论 & 官方 install.sh） =====
+    // ❌ 不要从 PyPI 安装（已废弃，停在 0.19.0）
+    // ✅ 正确流程：git clone + uv pip install -e (editable to existing venv)
+    // 📝 目录要求：必须在 DATA_DIR 下持久化，不能在 target/
+    
     if (updateState === "updating") {
       return new Response(JSON.stringify({ error: "更新进行中，请等待" }), {
         status: 409, headers: { "Content-Type": "application/json" },
       });
     }
+
+    // 查找或初始化 hermes-repo 目录
+    const HERMES_REPO_DIR = `${DATA_DIR}/hermes-repo`;
+    const VENV_DIR = `${DATA_DIR}/venv`;
+    const VENV_PY = `${VENV_DIR}/bin/python3`;
+    // GitHub 镜像加速：尝试多个候选 URL，防止 GnuTLS -110 / DNS 污染等网络错误
+    const GITHUB_MIRROR_PREFIXES = [
+      "",                          // 直连
+      "https://ghproxy.com/",      // gh-proxy
+      "https://mirror.ghproxy.com/", // mirror.ghproxy
+      "https://gh-proxy.com/",     // gh-proxy
+    ];
+    const REPO_PATH = "NousResearch/hermes-agent";
+    function repoUrlCandidates() {
+      return GITHUB_MIRROR_PREFIXES.map(p => p ? `${p}https://github.com/${REPO_PATH}.git` : `https://github.com/${REPO_PATH}.git`);
+    }
+    function fetchUrlCandidates(repoDir) {
+      return GITHUB_MIRROR_PREFIXES.map(p => p ? `${p}https://github.com/${REPO_PATH}.git` : `https://github.com/${REPO_PATH}.git`);
+    }
+        
+    // uv 优先用 data/bin/uv（安装脚本落地位置），兜底 venv/bin/uv 软链
+    const UV = existsSync(`${DATA_DIR}/bin/uv`) ? `${DATA_DIR}/bin/uv` : UV_BIN_PATH;
+    
+    log(`[更新] hermes-repo=${HERMES_REPO_DIR}, venv=${VENV_DIR}, uv=${UV}`);
+    
+    // 判断是否需要重新 clone：目录不存在，或存在但缺 pyproject.toml/setup.py（残缺）
+    const repoValid = existsSync(`${HERMES_REPO_DIR}/pyproject.toml`) || existsSync(`${HERMES_REPO_DIR}/setup.py`);
+    const shouldClone = !repoValid;
+    
     // 重置状态
     updateState = "updating";
     updateOutput = [];
     updateExitCode = null;
-
+    
+    // 获取最新 release 的 tag 名（比如 v2026.8.3）
+    let targetTag = "main"; // 默认主分支
+    try {
+      const res = await fetch('https://api.github.com/repos/NousResearch/hermes-agent/releases/latest', {
+        headers: { 'User-Agent': 'fnos-hermes-agent/0.19.0' },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        targetTag = String(data.tag_name || "main");
+        log(`[更新] 目标版本 tag: ${targetTag}`);
+      }
+    } catch (e) {
+      log(`[更新] GitHub API 失败，使用默认 main: ${e.message}`);
+    }
+    
     const env = {
       ...process.env,
-      UV_INDEX_URL: "https://mirrors.aliyun.com/pypi/simple/",
+      HOME: DATA_DIR,
+      PATH: `${VENV_BIN}:${DATA_DIR}/bin:/usr/local/bin:/usr/bin:/bin`,
       UV_CACHE_DIR: `${DATA_DIR}/.uv-cache`,
-      PATH: `${VENV_BIN}:/usr/local/bin:/usr/bin:/bin`,
+      // 显式设置 VIRTUAL_ENV 以便 uv 知道用哪个 venv
+      VIRTUAL_ENV: VENV_DIR,
+      // 钉住解释器，防止继承的 UV_PYTHON 让 uv 重建 venv（对齐官方 install.sh）
+      UV_PYTHON: VENV_PY,
     };
-
-    try {
-      const proc = spawn({
-        cmd: [UV_BIN_PATH, "pip", "install", "--python", `${DATA_DIR}/venv/bin/python3`, "--upgrade", "--no-cache", "hermes-agent[all]"],
-        env,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-      });
+    
+    // 后台执行器：走 node-adapter 的 spawn（单参数对象形式），逐行收集 stdout/stderr
+    // 可选 envOverride：构建 web/ui-tui 时需把 data/node/bin 挂进 PATH，缺省沿用闭包 env
+    const runStep = (cmdArr, envOverride) => new Promise((resolve) => {
+      let proc;
+      try {
+        proc = spawn({ cmd: cmdArr, env: envOverride || env, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+      } catch (e) {
+        updateOutput.push(`[stderr] spawn 失败：${e.message || e}`);
+        resolve(-1);
+        return;
+      }
       updateProc = proc;
-
       const decoder = new TextDecoder();
-      const collectStream = async (stream, isErr) => {
+      const pump = async (stream, isErr) => {
+        if (!stream) return;
         const reader = stream.getReader();
         try {
           while (true) {
@@ -2488,32 +2599,279 @@ async function handleFetch(req) {
           }
         } catch {}
       };
+      pump(proc.stdout, false);
+      pump(proc.stderr, true);
+      proc.exited.then((code) => resolve(code));
+    });
 
-      collectStream(proc.stdout, false);
-      collectStream(proc.stderr, true);
-
-      proc.exited.then((code) => {
-        updateExitCode = code;
-        updateState = code === 0 ? "done" : "error";
-        if (code === 0) {
-          // 清除版本缓存，下次 status 查询时重新检测
-          try { unlinkSync(VERSION_FILE); } catch {}
-          try { HERMES_VERSION = "unknown"; } catch {}
+    (async () => {
+      try {
+        // 步骤 1：clone（首次/残缺）或 fetch+reset（已有）从最新 release tag
+        if (shouldClone) {
+          if (existsSync(HERMES_REPO_DIR)) {
+            log(`[更新] 目录残缺，先清理 ${HERMES_REPO_DIR}`);
+            const rmCode = await runStep(["rm", "-rf", HERMES_REPO_DIR]);
+            if (rmCode !== 0) throw new Error(`清理旧目录失败 (exit ${rmCode})`);
+          }
+          const urls = repoUrlCandidates();
+          log(`[更新] 开始克隆 (${urls.length}个镜像)...`);
+          let lastError = null;
+          for (const url of urls) {
+            log(`[更新] 尝试：${url}`);
+            // 从 tag 直接 checkout
+            const code = await runStep(["git", "clone", "--depth", "1", "--branch", targetTag, url, HERMES_REPO_DIR]);
+            if (code === 0) {
+              log(`[更新] 克隆成功（经 ${url.split('/')[2] || 'direct'}）`);
+              break;
+            } else {
+              lastError = new Error(`git clone 失败 (exit ${code})`);
+              log(`[更新] 克隆失败：exit ${code}`);
+            }
+            // 若失败则删除可能产生的空目录
+            try { require('fs').unlinkSync(HERMES_REPO_DIR); } catch {}
+          }
+          if (!existsSync(HERMES_REPO_DIR)) throw lastError;
+        } else {
+          // 对齐 hermes update：git fetch tag + reset --hard，避免本地改动导致冲突
+          const urls = fetchUrlCandidates();
+          log(`[更新] 开始 fetch tag ${targetTag} (尝试${urls.length}个镜像)...`);
+          let lastError = null;
+          let success = false;
+          for (const url of urls) {
+            try {
+              log(`[更新] 设置 origin: ${url}`);
+              const setUrlCode = await runStep(["sh", "-c", `cd "${HERMES_REPO_DIR}" && git remote set-url origin ${url}`]);
+              if (setUrlCode !== 0) throw new Error(`设置 origin 失败`);
+                      
+              log(`[更新] fetch tag: ${targetTag}`);
+              const fetchCode = await runStep(["sh", "-c", `cd "${HERMES_REPO_DIR}" && git fetch --depth 1 origin ${targetTag}`]);
+              if (fetchCode !== 0) throw new Error(`fetch 失败 exit ${fetchCode}`);
+                      
+              log(`[更新] reset to tag: ${targetTag}`);
+              const resetCode = await runStep(["sh", "-c", `cd "${HERMES_REPO_DIR}" && git reset --hard FETCH_HEAD`]);
+              if (resetCode !== 0) throw new Error(`reset 失败 exit ${resetCode}`);
+                      
+              success = true;
+              log(`[更新] 更新成功（经 ${url.split('/')[2] || 'direct'}）`);
+              break;
+            } catch (e) {
+              lastError = e;
+              log(`[更新] 本次尝试失败：${e.message}`);
+            }
+          }
+          if (!success) throw lastError;
         }
-        updateProc = null;
-        log(`hermes self-update finished: exit=${code}`);
-      });
+        log(`[更新] 代码就绪`);
 
-      return new Response(JSON.stringify({ ok: true, message: "更新已启动" }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    } catch (e) {
-      updateState = "error";
-      updateProc = null;
-      return new Response(JSON.stringify({ error: e.message || String(e) }), {
-        status: 500, headers: { "Content-Type": "application/json" },
-      });
-    }
+        // 步骤 2：分层 editable 安装到现有 venv（对齐官方 install.sh 四层策略）
+        //   Tier 0: uv sync --extra all --locked（哈希校验，需 uv.lock）
+        //   Tier 1: uv pip install -e ".[all]"
+        //   Tier 3: uv pip install -e "."（裸装保底）
+        //   注意：是 --extra all，不是 --all-extras（后者会拉 matrix/rl 等需系统编译的 extra）
+        let insCode = 1;
+        if (existsSync(`${HERMES_REPO_DIR}/uv.lock`)) {
+          log(`[更新] Tier 0: uv sync --extra all --locked`);
+          insCode = await runStep(["sh", "-c", `cd "${HERMES_REPO_DIR}" && UV_PROJECT_ENVIRONMENT="${VENV_DIR}" "${UV}" sync --extra all --locked`]);
+          if (insCode === 0) log(`[更新] Tier 0 成功（哈希校验 uv sync）`);
+        }
+        if (insCode !== 0) {
+          log(`[更新] Tier 1: ${UV} pip install --python ${VENV_PY} -e .[all]`);
+          insCode = await runStep(["sh", "-c", `cd "${HERMES_REPO_DIR}" && "${UV}" pip install --python "${VENV_PY}" -e ".[all]"`]);
+          if (insCode === 0) log(`[更新] Tier 1 成功（-e .[all]）`);
+        }
+        if (insCode !== 0) {
+          log(`[更新] Tier 3: ${UV} pip install --python ${VENV_PY} -e .`);
+          insCode = await runStep(["sh", "-c", `cd "${HERMES_REPO_DIR}" && "${UV}" pip install --python "${VENV_PY}" -e "."`]);
+          if (insCode === 0) log(`[更新] Tier 3 成功（core only）`);
+        }
+        if (insCode !== 0) throw new Error(`editable 安装失败（Tier 0/1/3 均失败，exit ${insCode}）`);
+        log(`[更新] editable 安装完成`);
+
+        // 步骤 2.6：补齐 provider SDK（anthropic / openai）
+        // 原因：Tier 0 `uv sync --extra all --locked` 会按 lock 裁剪 venv，若 lock 的
+        // all extra 不含 anthropic，会把它卸载掉，导致 anthropic_messages 模式报
+        // "The 'anthropic' package is required"。此处显式重装兵先保底。
+        log(`[更新] 补齐 provider SDK（anthropic / openai）...`);
+        const sdkCode = await runStep(["sh", "-c",
+          `"${UV}" pip install --python "${VENV_PY}" "anthropic>=0.39.0" "openai"`]);
+        if (sdkCode === 0) log(`[更新] provider SDK 就绪`);
+        else log(`[更新] ⚠️ provider SDK 安装失败 (exit ${sdkCode})，Anthropic 对话可能不可用`);
+
+        // 步骤 2.5：确保 Node.js 环境（git 版需要 npm 构建 web/ui-tui）
+        const NODE_INSTALL_DIR = `${DATA_DIR}/node`;
+        const NODE_BIN_DIR = `${NODE_INSTALL_DIR}/bin`;
+        const NODE_EXE_PATH = `${NODE_BIN_DIR}/node`;
+        const NODE_TGZ = `${TMP_DIR}/node.tgz`;
+        let arch = process.arch; // x64 or arm64
+        let nodeVer = 'v24.15.0'; // 满足 >=22.22.0 要求
+        let nodeUrl = '';
+        if (arch === 'x64') {
+          nodeUrl = `https://nodejs.org/download/release/${nodeVer}/node-${nodeVer}-linux-x64.tar.gz`;
+        } else if (arch === 'arm64') {
+          nodeUrl = `https://nodejs.org/download/release/${nodeVer}/node-${nodeVer}-linux-arm64.tar.gz`;
+        }
+        
+        if (!nodeUrl) {
+          log(`[更新] 警告：不支持的架构 ${arch}，跳过 Node.js 安装`);
+        } else if (existsSync(NODE_EXE_PATH)) {
+          log(`[更新] Node.js 已存在：${NODE_EXE_PATH}`);
+        } else {
+          log(`[更新] 未检测到 Node.js，将从官方下载并解压到 ${NODE_INSTALL_DIR}...`);
+          mkdirSync(DATA_DIR, { recursive: true }); // 确保 parent dir 存在
+          
+          try {
+            // 用 curl+sh 管道方式下载并解压（参考 ensure_uv 模式）
+            log(`[更新] 下载 Node.js ${arch} tarball (${nodeUrl})...`);
+            const installNodeCode = await runStep([
+              "sh", "-c",
+              `curl -L --retry 3 --max-time 120 '${nodeUrl}' -o '${NODE_TGZ}' 2>&1 && ` +
+              `tar -xzf '${NODE_TGZ}' -C '${DATA_DIR}' --strip-components=1 2>&1`
+            ]);
+            
+            if (installNodeCode === 0 && existsSync(NODE_EXE_PATH)) {
+              // 验证：运行 --version
+              const versionCheck = spawnSync(NODE_EXE_PATH, ["--version"]);
+              const verOut = (versionCheck.stdout || "").toString("utf8").trim();
+              if (verOut) {
+                log(`[更新] Node.js 安装成功：${verOut}`);
+              } else {
+                log(`[更新] ⚠️ Node.js 解压后无法运行`);
+              }
+            } else {
+              log(`[更新] ⚠️ Node.js 安装失败 (exit ${installNodeCode}), 后续构建将跳过`);
+            }
+          } catch (e) {
+            log(`[更新] Node.js 安装异常：${e.message || e}`);
+          } finally {
+            try { unlinkSync(NODE_TGZ); } catch {}
+          }
+        }
+
+        // 步骤 3：确保 Node.js 在 PATH 中（data/node/bin），然后构建 web 和 ui-tui 组件
+        if (!NODE_EXE_PATH) {
+          log(`[更新] 警告：未检测到 Node.js 环境 (${NODE_EXE_PATH} 不存在)，跳过构建`);
+        } else {
+          log(`[更新] Node.js found: ${NODE_EXE_PATH}, 构建 web 和 ui-tui 组件...`);
+          const envWithNode = { ...process.env, PATH: `${NODE_BIN_DIR}:${process.env.PATH}` };
+          
+          // 3.1: web 组件（Dashboard SPA）→ 产物在 hermes_cli/web_dist
+          // 要点：
+          //   1. 国内网络直连 registry.npmjs.org 极易超时 → 先用 npmmirror 镜像，失败再回退官方源
+          //   2. web 依赖 @hermes/shared(file: workspace 包)，须从仓库根按 workspace 装全
+          //   3. 以 web_dist/index.html + assets/*.js 存在为成功判据：产物缺失时 Dashboard
+          //      只会返回 HTML 壳，/assets/* 全部 404 → /chat 白屏（0.20 Git 版升级后的典型故障）
+          const WEB_DIST_DIR = `${HERMES_REPO_DIR}/hermes_cli/web_dist`;
+          const webDistOk = () => {
+            try {
+              if (!existsSync(`${WEB_DIST_DIR}/index.html`)) return false;
+              return readdirSync(`${WEB_DIST_DIR}/assets`).some(f => f.endsWith(".js"));
+            } catch { return false; }
+          };
+          const npmRegistries = ["https://registry.npmmirror.com", "https://registry.npmjs.org"];
+          let webBuilt = false;
+          for (const registry of npmRegistries) {
+            if (webBuilt) break;
+            try {
+              log(`[更新] 构建 web 前端（npm 源：${registry}）...`);
+              const code1 = await runStep([
+                "sh", "-c",
+                `cd "${HERMES_REPO_DIR}" && npm install --workspace web --include=dev --no-audit --no-fund --registry ${registry} 2>&1 && npm run -w web build`
+              ], envWithNode);
+              if (code1 === 0 && webDistOk()) {
+                webBuilt = true;
+                log(`[更新] web 构建成功（web_dist 产物已验证）`);
+                // 同步到随包兜底目录（app/hermes-web-dist），作为 HERMES_WEB_DIST 兜底链的最新产物
+                try {
+                  const PKG_DIST = `${__dirname}/../hermes-web-dist`;
+                  const syncCode = await runStep(
+                    ["sh", "-c", `rm -rf "${PKG_DIST}" && cp -r "${WEB_DIST_DIR}" "${PKG_DIST}"`],
+                    envWithNode
+                  );
+                  log(syncCode === 0
+                    ? `[更新] web 产物已同步到随包兜底目录`
+                    : `[更新] 同步随包兜底目录失败 exit=${syncCode}（不影响本次）`);
+                } catch (e2) {
+                  log(`[更新] 同步随包兜底目录异常：${e2.message}（不影响本次）`);
+                }
+              } else if (code1 === 0) {
+                log(`[更新] ⚠️ web 构建 exit=0 但 web_dist 产物缺失，尝试下一个 npm 源`);
+              } else {
+                log(`[更新] web 构建失败 (exit ${code1})，尝试下一个 npm 源`);
+              }
+            } catch (e) {
+              log(`[更新] web 构建异常：${e.message}`);
+            }
+          }
+          if (!webBuilt) {
+            log(`[更新] ⚠️ web 现场构建失败：Dashboard /chat 将因 /assets 资源缺失而白屏，请在更新页点「重建前端」修复`);
+          }
+          
+          // 3.2: ui-tui 组件（/chat 页面 TUI）
+          try {
+            log(`[更新] 构建 ui-tui 终端...`);
+            const code2 = await runStep([
+              "sh", "-c",
+              `cd "${HERMES_REPO_DIR}/ui-tui" && npm run build:ink 2>&1 && npm run build 2>&1`
+            ], envWithNode);
+            if (code2 === 0) {
+              const entryPath = `${HERMES_REPO_DIR}/ui-tui/dist/entry.js`;
+              if (existsSync(entryPath)) {
+                const size = (await statSync(entryPath)).size;
+                log(`[更新] ui-tui 构建成功 (entry.js ${size} bytes)`);
+              } else {
+                log(`[更新] ui-tui 构建成功但 entry.js 未找到`);
+              }
+            } else {
+              log(`[更新] ui-tui 构建失败 (exit ${code2})，可能 PTY 连接时会懒构建`);
+            }
+          } catch (e) {
+            log(`[更新] ui-tui 构建异常：${e.message}`);
+          }
+        }
+
+        // 步骤 4：清缓存并重新探测版本
+        try { unlinkSync(VERSION_FILE); } catch {}
+        let newVer = null;
+        
+        // 等待新版本二进制文件准备好（避免 race condition）
+        log(`[更新] 等待 2 秒让新的 Hermes 二进制文件就绪...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        const verResult = spawnSync("sh", ["-c", `${HERMES_BIN_PATH} --version`], {
+          timeout: 10000,
+          killSignal: "SIGKILL"
+        });
+        const verOut = (verResult.stdout || verResult.stderr || "").toString("utf8");
+        if (verOut) {
+          newVer = formatHermesVersion(verOut);
+          HERMES_VERSION = newVer;
+          try { writeFileSync(VERSION_FILE, newVer, { mode: 0o644 }); } catch {}
+          log(`[更新] 新版本号：${newVer}`);
+        } else {
+          throw new Error(`无法获取新版本号 (exit=${verResult.status})`);
+        }
+
+        updateExitCode = 0;
+        updateState = "done";
+        updateProc = null;
+        log(`[更新] 成功！版本：${newVer}`);
+      } catch (e) {
+        updateExitCode = 1;
+        updateState = "error";
+        updateProc = null;
+        updateOutput.push(`[错误] ${e.message || String(e)}`);
+        log(`[更新] 失败：${e.message || String(e)}`);
+      }
+    })();
+
+    return new Response(JSON.stringify({ 
+      ok: true, 
+      message: "开始从 GitHub 克隆/更新代码...",
+      repoDir: HERMES_REPO_DIR,
+      venvDir: VENV_DIR,
+    }), {
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   if (path === "/api/hermes/update/status") {
@@ -2535,6 +2893,144 @@ async function handleFetch(req) {
       output: updateOutput.slice(-50),
       exitCode: updateExitCode,
       version: currentVer,
+    }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  // ===== Web 前端单独重建（升级后 web_dist 产物缺失时不用重跑完整更新） =====
+  if (path === "/api/hermes/rebuild-web" && req.method === "POST") {
+    if (rebuildWebState === "building") {
+      return new Response(JSON.stringify({ error: "重建进行中，请等待" }), {
+        status: 409, headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (updateState === "updating") {
+      return new Response(JSON.stringify({ error: "完整更新进行中，请等待完成" }), {
+        status: 409, headers: { "Content-Type": "application/json" },
+      });
+    }
+    const REPO_DIR = `${DATA_DIR}/hermes-repo`;
+    if (!existsSync(`${REPO_DIR}/web/package.json`)) {
+      return new Response(JSON.stringify({ error: "hermes-repo 不存在（尚未执行过 Git 版更新），请先在更新页执行完整更新" }), {
+        status: 400, headers: jsonHeaders(),
+      });
+    }
+    const NODE_BIN = `${DATA_DIR}/node/bin`;
+    if (!existsSync(`${NODE_BIN}/node`)) {
+      return new Response(JSON.stringify({ error: "Node.js 不存在（data/node/bin/node），无法构建前端" }), {
+        status: 400, headers: jsonHeaders(),
+      });
+    }
+
+    rebuildWebState = "building";
+    rebuildWebOutput = [];
+    rebuildWebExitCode = null;
+
+    const envNode = { ...process.env, HOME: DATA_DIR, PATH: `${NODE_BIN}:${DATA_DIR}/bin:/usr/local/bin:/usr/bin:/bin` };
+    const runBuildStep = (cmdArr) => new Promise((resolve) => {
+      let proc;
+      try {
+        proc = spawn({ cmd: cmdArr, env: envNode, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+      } catch (e) {
+        rebuildWebOutput.push(`[stderr] spawn 失败：${e.message || e}`);
+        resolve(-1);
+        return;
+      }
+      rebuildWebProc = proc;
+      const decoder = new TextDecoder();
+      const pump = async (stream, isErr) => {
+        if (!stream) return;
+        const reader = stream.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const text = decoder.decode(value, { stream: true });
+            for (const line of text.split("\n")) {
+              if (line.trim()) {
+                rebuildWebOutput.push((isErr ? "[stderr] " : "") + line.trim());
+                if (rebuildWebOutput.length > 200) rebuildWebOutput.shift();
+              }
+            }
+          }
+        } catch {}
+      };
+      pump(proc.stdout, false);
+      pump(proc.stderr, true);
+      proc.exited.then((code) => resolve(code));
+    });
+
+    (async () => {
+      try {
+        const DIST = `${REPO_DIR}/hermes_cli/web_dist`;
+        const distOk = () => {
+          try {
+            if (!existsSync(`${DIST}/index.html`)) return false;
+            return readdirSync(`${DIST}/assets`).some(f => f.endsWith(".js"));
+          } catch { return false; }
+        };
+        // 镜像优先，官方源兑底（与更新流程同一策略）
+        const registries = ["https://registry.npmmirror.com", "https://registry.npmjs.org"];
+        let ok = false;
+        for (const registry of registries) {
+          if (ok) break;
+          log(`[重建前端] npm 源: ${registry}`);
+          rebuildWebOutput.push(`>>> npm install + build（源: ${registry}）...`);
+          const code = await runBuildStep([
+            "sh", "-c",
+            `cd "${REPO_DIR}" && npm install --workspace web --include=dev --no-audit --no-fund --registry ${registry} 2>&1 && npm run -w web build`
+          ]);
+          if (code === 0 && distOk()) {
+            ok = true;
+            log(`[重建前端] 构建成功（web_dist 产物已验证）`);
+          } else {
+            log(`[重建前端] 本次尝试未产出有效产物 (exit ${code})`);
+          }
+        }
+        if (!ok) throw new Error("web 构建失败（两个 npm 源均未产出 web_dist 产物，详见输出日志）");
+
+        // 把版本严格匹配的产物同步到随包兜底目录（app/hermes-web-dist），
+        // 以后即使 hermes-repo 被清，dashboard 仍能出页面（HERMES_WEB_DIST 兜底链）
+        const PKG_DIST = `${__dirname}/../hermes-web-dist`;
+        const syncCode = await runBuildStep([
+          "sh", "-c", `rm -rf "${PKG_DIST}" && cp -r "${DIST}" "${PKG_DIST}"`
+        ]);
+        if (syncCode === 0) {
+          log(`[重建前端] 产物已同步到随包兜底目录: ${PKG_DIST}`);
+        } else {
+          log(`[重建前端] 同步随包兜底目录失败（不影响本次生效）exit=${syncCode}`);
+        }
+
+        // 重启 Dashboard 使其加载新静态资源（web_server 对 index.html 有令牌注入等处理，重启最稳）
+        const dbPid = readPid(PID_DASHBOARD);
+        if (dbPid) {
+          rebuildWebOutput.push(">>> 重启 Dashboard 以加载新前端...");
+          await stopPid(PID_DASHBOARD);
+          await new Promise(r => setTimeout(r, 800));
+          spawnDashboard();
+          log(`[重建前端] Dashboard 已重启 (old pid=${dbPid})`);
+        }
+        rebuildWebExitCode = 0;
+        rebuildWebState = "done";
+      } catch (e) {
+        rebuildWebExitCode = 1;
+        rebuildWebState = "error";
+        rebuildWebOutput.push(`[错误] ${e.message || String(e)}`);
+        log(`[重建前端] 失败：${e.message || String(e)}`);
+      } finally {
+        rebuildWebProc = null;
+      }
+    })();
+
+    return new Response(JSON.stringify({ ok: true, message: "开始重建 Dashboard 前端..." }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  if (path === "/api/hermes/rebuild-web/status") {
+    return new Response(JSON.stringify({
+      status: rebuildWebState,
+      output: rebuildWebOutput.slice(-50),
+      exitCode: rebuildWebExitCode,
     }), { headers: { "Content-Type": "application/json" } });
   }
 
@@ -2638,17 +3134,22 @@ async function handleFetch(req) {
     const file = url.searchParams.get("file") || "";
     const allowed = [
       "gateway.log","errors.log","agent.log","gui.log",
-      "gateway-restart.log","gateway-shutdown-diag.log","gateway-exit-diag.log","hermes.log",
+      "gateway-restart.log","gateway-shutdown-diag.log","gateway-exit-diag.log","monitor.log","info.log",
     ];
     if (!allowed.includes(file)) {
       return new Response(JSON.stringify({ error: "disallowed" }), { headers: jsonHeaders() });
     }
-    const fp = file === "hermes.log" ? `${VAR_DIR}/${file}` : `${DATA_DIR}/logs/${file}`;
+    // monitor.log（Monitor 自身日志）与 info.log（安装日志）在 VAR_DIR，其余为 Hermes 真实日志在 DATA_DIR/logs
+    const fp = (file === "monitor.log" || file === "info.log") ? `${VAR_DIR}/${file}` : `${DATA_DIR}/logs/${file}`;
+    // 前端可传 lines 指定返回末尾行数（50/100/200/500），未传或非法时兜底 200，上限 2000 防止过大响应
+    let want = parseInt(url.searchParams.get("lines") || "", 10);
+    if (!Number.isFinite(want) || want <= 0) want = 200;
+    if (want > 2000) want = 2000;
     let lines = [], size = 0;
     try {
       if (existsSync(fp)) {
         size = statSync(fp).size;
-        lines = readFileSync(fp, "utf8").split("\n").filter(l => l.trim()).slice(-200);
+        lines = readFileSync(fp, "utf8").split("\n").filter(l => l.trim()).slice(-want);
       }
     } catch {}
     return new Response(JSON.stringify({ lines, size }), { headers: jsonHeaders() });
@@ -2658,15 +3159,15 @@ async function handleFetch(req) {
   if (path === "/api/logs/clear" && req.method === "POST") {
     let body = {};
     try { body = await req.json(); } catch {}
-    const file = body.file || "hermes.log";
+    const file = body.file || "monitor.log";
     const allowed = [
       "gateway.log","errors.log","agent.log","gui.log",
-      "gateway-restart.log","gateway-shutdown-diag.log","gateway-exit-diag.log","hermes.log",
+      "gateway-restart.log","gateway-shutdown-diag.log","gateway-exit-diag.log","monitor.log","info.log",
     ];
     if (!allowed.includes(file)) {
       return new Response(JSON.stringify({ error: "disallowed" }), { headers: jsonHeaders() });
     }
-    const fp = file === "hermes.log" ? `${VAR_DIR}/${file}` : `${DATA_DIR}/logs/${file}`;
+    const fp = (file === "monitor.log" || file === "info.log") ? `${VAR_DIR}/${file}` : `${DATA_DIR}/logs/${file}`;
     try {
       if (existsSync(fp)) writeFileSync(fp, "");
     } catch (e) {
@@ -3157,6 +3658,7 @@ async function handleFetch(req) {
     const toolStart = Math.max(0, toolCursor - e.tool_base);
     return new Response(JSON.stringify({
       status: e.status,
+      prompt: e.prompt,
       output: e.output.slice(outStart),
       cursor: e.output_base + e.output.length,
       tool_events: e.tool_events.slice(toolStart),
@@ -3449,74 +3951,35 @@ process.on("unhandledRejection", (err) => {
   log(`[FATAL] unhandledRejection: ${err?.message || err}\n${err?.stack || ""}`);
 });
 
-// ─── 单实例保护：绑定 unix socket 前先探测是否已有存活实例 ─────────────
-// serve() 对 unix socket 的 listen 是异步的，EADDRINUSE 只会以 uncaughtException
-// 的形式在"Monitor ready"日志打印之后才出现，无法同步发现重复启动。因此启动前
-// 主动探测 socket 文件是否真的有进程在监听：如果有，直接退出，避免抢占；如果
-// 只是残留的旧文件（上次进程被 kill -9 等方式非正常终止，没来得及清理），先删除
-// 再正常绑定。
-function checkSocketAlive(path) {
-  return new Promise((resolve) => {
-    const sock = net.connect(path);
-    const finish = (alive) => {
-      try { sock.destroy(); } catch {}
-      resolve(alive);
-    };
-    sock.once("connect", () => finish(true));
-    sock.once("error", () => finish(false));
-    setTimeout(() => finish(false), 1000);
-  });
-}
-
-if (existsSync(SOCKET_PATH)) {
-  const alive = await checkSocketAlive(SOCKET_PATH);
-  if (alive) {
-    log(`[FATAL] 检测到另一个 monitor 实例已在监听 ${SOCKET_PATH}，本进程退出以避免重复启动`);
-    process.exit(1);
-  } else {
-    log(`[启动清理] 发现残留的 socket 文件（无进程监听），已删除：${SOCKET_PATH}`);
-    try { unlinkSync(SOCKET_PATH); } catch (e) {
-      log(`[启动清理] 删除残留 socket 文件失败: ${e.message}`);
+// ─── 服务处理器导出（socket 绑定、chmod 与单实例检查已移交 boot.js）──────
+// boot.js 独占 unix socket 与 serve()，并在其 fetch(req, server) 中调用本函数；
+// 保持原 serve().fetch 的路由语义不变：/api/chat/ws 升级、Dashboard WS 反代、
+// 其余交回 handleFetch。原“Monitor ready”日志与 socket chmod 现由 boot.js 负责。
+export function handleServe(req, server) {
+  const url = new URL(req.url);
+  const wsPath = url.pathname.replace(/^\/app\/[^/]+/, "") || "/";
+  // WebSocket 升级：/api/chat/ws?session_id=xxx&token=xxx
+  if (wsPath === "/api/chat/ws") {
+    const token = url.searchParams.get("token") || "";
+    if (MONITOR_TOKEN && token !== MONITOR_TOKEN) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }
+    const sessionId = url.searchParams.get("session_id") || "";
+    const message = wsMessageQueue.get(sessionId);
+    if (!sessionId || !message) {
+      return new Response(JSON.stringify({ error: "no pending message for session" }), { status: 400 });
+    }
+    wsMessageQueue.delete(sessionId);
+    const upgraded = server.upgrade(req, { data: { sessionId, message, stopCtrl: null } });
+    if (!upgraded) return new Response("WebSocket upgrade failed", { status: 500 });
+    return; // 已升级
   }
+  // Dashboard WebSocket 反代：/proxy/dashboard/api/(ws|events|pty)
+  if (matchDashboardWsPath(wsPath)) {
+    return upgradeDashboardWs(req, server, wsPath, url);
+  }
+  return handleFetch(req);
 }
 
-serve({
-  fetch(req, server) {
-    const url = new URL(req.url);
-    const wsPath = url.pathname.replace(/^\/app\/[^/]+/, "") || "/";
-    // WebSocket 升级：/api/chat/ws?session_id=xxx&token=xxx
-    if (wsPath === "/api/chat/ws") {
-      const token = url.searchParams.get("token") || "";
-      if (MONITOR_TOKEN && token !== MONITOR_TOKEN) {
-        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
-      }
-      const sessionId = url.searchParams.get("session_id") || "";
-      const message = wsMessageQueue.get(sessionId);
-      if (!sessionId || !message) {
-        return new Response(JSON.stringify({ error: "no pending message for session" }), { status: 400 });
-      }
-      wsMessageQueue.delete(sessionId);
-      const upgraded = server.upgrade(req, { data: { sessionId, message, stopCtrl: null } });
-      if (!upgraded) return new Response("WebSocket upgrade failed", { status: 500 });
-      return; // 已升级
-    }
-    // Dashboard WebSocket 反代：/proxy/dashboard/api/(ws|events|pty)
-    if (matchDashboardWsPath(wsPath)) {
-      return upgradeDashboardWs(req, server, wsPath, url);
-    }
-    return handleFetch(req);
-  },
-  websocket: wsHandler,
-  error(err) {
-    log(`Server error: ${err?.message || err}`);
-    return new Response(JSON.stringify({ error: "Internal error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  },
-  unix: SOCKET_PATH,
-  idleTimeout: 255,
-});
-try { chmodSync(SOCKET_PATH, 0o777); } catch {}
-log(`Monitor ready — unix:${SOCKET_PATH} (base=${BASE_PATH || "/"}) | dashboard proxied at /proxy/dashboard/`);
+// WebSocket 处理器导出：boot.js 的 websocket 调度器据此委派 open/message/close。
+export { wsHandler as websocket };
