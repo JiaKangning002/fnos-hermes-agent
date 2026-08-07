@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（格式：0.18.0，留空则使用 manifest 中的版本）'
+        description: '版本号（格式：0.20.0.20，留空则使用 manifest 中的版本）'
         required: false
         default: ''
 
@@ -65,13 +65,16 @@ jobs:
           which fnpack
           echo "fnpack 已安装并可用"
 
-      # 6. 更新 manifest 版本号
-      - name: Update manifest version
+      # 6. 更新 manifest 和 app-version.env
+      - name: Update manifest and app version
         run: |
           VERSION="${{ steps.target_version.outputs.target_version }}"
+          # 更新 manifest
           sed -i "s/^version.*=/version       = $VERSION/" ${{ env.MANIFEST_FILE }} || exit 1
-          echo "Updated manifest:"
-          grep "^version" ${{ env.MANIFEST_FILE }}
+          # 同步到 app-version.env（运行时从该文件读取版本）
+          echo "APP_VERSION=$VERSION" > config/bootstrap/app-version.env
+          echo "Updated manifest:" && grep "^version" ${{ env.MANIFEST_FILE }}
+          echo "Updated app version:" && cat config/bootstrap/app-version.env
 
       # 7. 创建输出目录
       - name: Create dist directory
