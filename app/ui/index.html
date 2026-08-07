@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
   <!-- iOS Safari 专用：防止输入框被键盘遮挡 -->
   <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" sizes="64x64" href="images/64.png">
   <title>Hermes Agent</title>
@@ -24,6 +25,15 @@
        否则关键帧会覆盖居中位移、视觉上变成从右侧飞入；退场由 .out 类走 transition。
        底色：半透明表面色 + 毛玻璃，随 --bg2/--text 自适应浅/深色主题；
        无 color-mix 支持时回退为不透明 --bg2 实底。错误态加 .err。 */
+
+    /* ── 诊断模式导航禁闭状态 ── */
+    /* 仅在诊断模式下生效：只禁用 概览/对话/模型/通讯 四个导航项的点击进入，保留"更新"与"诊断"可用，不影响页面内容区 */
+    body.diagnose-lock .nav-item[data-view="overview"],
+    body.diagnose-lock .nav-item[data-view="chat"],
+    body.diagnose-lock .nav-item[data-view="settings"],
+    body.diagnose-lock .nav-item[data-view="channels"]{pointer-events:none!important;opacity:.5}
+
+
     .channel-toast{position:fixed;bottom:24px;left:50%;transform:translate(-50%,0);
       padding:9px 18px;border-radius:var(--radius-lg);font-size:13px;font-weight:500;line-height:1.5;
       color:var(--text);background:var(--bg2);
@@ -263,7 +273,10 @@
 
     /* ─── 服务卡片 ─── */
     .svcs{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto auto;gap:12px;margin-bottom:16px}
-    #cardSys{grid-row:span 2}
+    /* 服务控制单元格（左下）：与其余 svc 卡片同样外观，内部三个按钮等宽充满 */
+    #cardActions{display:flex;flex-direction:column}
+    #cardActions .svc-actions{display:flex;gap:12px;flex-wrap:wrap;flex:1;align-items:center;margin-top:0}
+    #cardActions .svc-actions .btn{flex:1 1 0;min-width:72px}
     .svc{background:var(--bg2);border:1px solid var(--border-subtle);border-radius:10px;padding:16px;position:relative;transition:box-shadow .3s;box-shadow:var(--shadow)}
     .svc-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
     .svc-name{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
@@ -313,6 +326,10 @@
     .btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
     .btn svg{width:14px;height:14px;flex-shrink:0}
     .btn-sm{padding:5px 10px;font-size:12px}
+    /* 日志复制按钮：宽度锁定为“已复制”（3 个字）宽，文字居中，
+       “复制”↔“已复制”切换时按钮不变形（+26px 为左右内边距与边框） */
+    .btn-copy-log,.btn-clear-log{min-width:calc(3em + 26px);justify-content:center}
+    .btn-copy-log.copied{color:var(--green);border-color:var(--green)}
     .btn-go{background:var(--green);color:var(--text-inverse);border-color:var(--green)}
     .btn-go:hover:not(:disabled){background:#2db84d;border-color:#2db84d}
     .btn-dash{background:var(--accent);color:var(--text-inverse);border-color:var(--accent);margin-left:auto;text-decoration:none}
@@ -332,14 +349,24 @@
     .log-box::-webkit-scrollbar{width:5px}
     .log-box::-webkit-scrollbar-track{background:transparent}
     .log-box::-webkit-scrollbar-thumb{background:#3a3b45;border-radius:3px}
-    .log-line{color:#c9d1d9;white-space:pre-wrap;word-break:break-all;animation:fadeIn .15s}
+    /* 日志文字配色：对齐 veenyi Dashboard 四色体系（绿=信息/正常 黄=警告 红=错误 灰=调试） */
+    .log-line{color:#c9cdd4;white-space:pre-wrap;word-break:break-all;animation:fadeIn .15s}
     .log-line:hover{background:rgba(255,255,255,0.04);margin:0 -14px;padding:0 14px;border-radius:2px}
     .log-empty{color:#6e7681;text-align:center;padding-top:120px;font-style:italic;font-family:inherit}
-    .log-line.log-start{color:#7ee787}
-    .log-line.log-stop{color:#f85149}
-    .log-line.log-error{color:#f85149;font-weight:600}
-    .log-line.log-ready{color:#79c0ff}
-    .log-line.log-warn{color:#d29922}
+    .log-line.log-start{color:#4ade80}
+    .log-line.log-stop{color:#f87171}
+    .log-line.log-error{color:#f87171;font-weight:600}
+    .log-line.log-ready{color:#4ade80}
+    .log-line.log-warn{color:#fbbf24}
+    .log-line.log-info{color:#4ade80}
+    .log-line.log-debug{color:#9ca3af}
+    /* 日志过滤器：2列网格，行用 display:contents 让 4 个分组共享列宽，
+       col1(来源/级别) 自适应取较宽者，col2(行数/组件) 从同一 x 对齐 */
+    .log-filter{display:grid;grid-template-columns:auto 1fr;column-gap:14px;row-gap:6px;align-items:center;padding:10px 18px 12px}
+    .log-filter-row{display:contents}
+    .log-filter-label{font-size:11px;color:var(--text3);min-width:32px;flex-shrink:0}
+    /* 同一行内的过滤分组（级别/组件并排，手机端整体换行） */
+    .log-filter-group{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
     .log-file-hdr{display:flex;justify-content:space-between;align-items:center;
       padding:6px 14px;background:#25262b;border-bottom:1px solid #2a2b35;
       border-radius:6px 6px 0 0;margin:-10px -14px 0;font-size:12px;color:#7ee787;font-weight:600;position:sticky;top:0}
@@ -438,6 +465,9 @@
     .session-tab.active{background:var(--accent-bg);border-color:var(--accent);color:var(--accent);font-weight:600}
     .session-tab.active .tab-dot{background:var(--accent)}
     .session-tab.streaming .tab-dot{background:#f59e0b;animation:pulse 1s infinite}
+    .session-tab.dragging{opacity:.45;cursor:grabbing}
+    .tab-drop-indicator{width:3px;align-self:stretch;background:var(--accent);border-radius:2px;flex:0 0 auto;box-shadow:0 0 6px var(--accent);pointer-events:none;animation:tabDropPulse .8s ease-in-out infinite}
+    @keyframes tabDropPulse{0%,100%{opacity:.55}50%{opacity:1}}
     .tab-new{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:var(--radius-sm);border:1px dashed var(--border);background:transparent;color:var(--text3);cursor:pointer;flex-shrink:0;transition:all .15s}
     .tab-new:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-bg)}
     .tab-new svg{width:13px;height:13px;stroke-width:2;stroke-linecap:round;stroke:currentColor;fill:none}
@@ -620,9 +650,41 @@
     /* ─── 输入框：空态单行 (min-height:32px) → 自动增高至 200px；聚焦/键盘弹出行为不受回退影响 ─── */
     .chat-input{flex:1;resize:none;border:none;border-radius:0;padding:8px 0;
       font-size:14px;font-family:inherit;background:transparent;color:var(--text);
-      line-height:1.5;max-height:200px;height:auto!important}
+      line-height:1.6;max-height:200px;height:auto!important}
     .chat-input:focus{outline:none}
     .chat-input::placeholder{color:var(--text3)}
+    
+    /* 桌面版增强：输入框容器增加内边距，发送按钮垂直居中对齐 */
+    @media (min-width: 768px) {
+      .chat-composer-inner{
+        padding:10px 14px 10px 18px;
+        border-radius:14px;
+      }
+      .chat-send-btn, .chat-file-btn{
+        margin-bottom:0;
+      }
+      .chat-send-btn svg,
+      .chat-file-btn svg {
+        transform:none;
+      }
+      .chat-composer-row{
+        align-items:center;
+      }
+      /* 多行输入优化：更舒适的行距/字号，更大可视高度，长文本滚动更顺滑 */
+      .chat-input{
+        font-size:15px;
+        line-height:1.65;
+        padding:7px 2px;
+        max-height:320px;
+        scrollbar-width:thin;
+        scrollbar-color:var(--border2) transparent;
+      }
+      /* 纤细滚动条，仅多行溢出时出现，配色随主题 */
+      .chat-input::-webkit-scrollbar{width:8px}
+      .chat-input::-webkit-scrollbar-track{background:transparent}
+      .chat-input::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px;border:2px solid transparent;background-clip:content-box}
+      .chat-input::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+    }
     .chat-send-btn{width:38px;height:38px;border-radius:50%;border:none;cursor:pointer;
       display:flex;align-items:center;justify-content:center;transition:all .15s;flex-shrink:0;
       margin-bottom:1px /* 单行时(输入条高40px)与文字垂直居中，多行时仍贴底 */}
@@ -726,6 +788,8 @@
     .prov-key .key-dot{color:var(--green);margin-right:4px}
     .prov-actions{display:flex;flex-direction:row;gap:6px;flex-shrink:0;align-items:stretch}
     .prov-actions .btn-sm{flex:0 1 calc((100% - 12px)/3);min-width:0;text-align:center;padding:8px 4px;font-size:12px;white-space:nowrap;min-height:36px}
+    /* ─── 模型卡片测试结果区域 ─── */
+    .prov-test-result{font-size:11px;margin-top:6px;color:var(--text3)}
 
     /* ─── 预设选择器 ─── */
 
@@ -789,6 +853,11 @@
     .form-test.error{color:var(--red)}
     /* 底部留白 16px 与 modal-body 底部 padding 对齐，按钮区上下留白视觉对称 */
     .modal-foot{padding:10px 20px 16px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:10px}
+    /* ─── 诊断模式导航项醒目样式 ─── */
+    /* 警示红 #f87171 文字与悬停背景，轻微呼吸动画增强注意，仅用于诊断入口 */
+    .nav-diag-alert{color:#f87171;font-weight:600;animation:pulse-red 2s ease-in-out infinite}
+    .nav-diag-alert:hover{background:rgba(248,113,113,.18)}
+    @keyframes pulse-red{0%,100%{opacity:.95}50%{opacity:1;color:#ff6b6b}}
     .mobile-nav-items{display:none}
 
     /* ─── 响应式 ─── */
@@ -797,6 +866,11 @@
       /* 小屏表单字号：纯按屏幕尺寸生效，所有设备统一 13px 表单字号档 */
       input, textarea, select { font-size: 13px !important; }
       html, body { height: 100%; overflow: hidden; position: relative; margin: 0; padding: 0; }
+
+      /* 小屏日志过滤器：改单列堆叠（来源/行数/级别/组件逐行），按钮更紧凑 */
+      .log-filter{grid-template-columns:1fr;padding:8px 12px 10px;column-gap:0;row-gap:6px}
+      .log-filter-label{min-width:28px;font-size:10px}
+      .log-filter .si-file-btn{padding:3px 7px;font-size:10px}
       
       /* 小屏弹窗：顶部留白须高于导航栏（约 47px），保证标题不被遮挡 */
       #providerModal{padding-top:54px}
@@ -843,6 +917,7 @@
       #cardSys{grid-row:auto;order:2}
       #cardGw{order:0}
       #cardDb{order:1}
+      #cardActions{order:3}
       .btns{flex-direction:row;flex-wrap:wrap;width:auto;gap:8px}
       .btn{width:auto;min-width:0}
       .svcs .svc-detail{flex-wrap:wrap}
@@ -972,6 +1047,26 @@
                   <span class="svc-status off" id="gwStatus">未启动</span>
                 </div>
               </div>
+              <div class="svc off" id="cardActions">
+                <div class="svc-top">
+                  <div class="svc-name">
+                    <div class="svc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></div>
+                    服务控制
+                  </div>
+                </div>
+                <!-- 三个控制按钮首屏均默认禁用，/api/status 返回后按服务实际状态启用 -->
+                <div class="btns svc-actions">
+                  <button class="btn btn-go" id="btnStart" onclick="startCheckAndAct()" disabled>
+                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>启动
+                  </button>
+                  <button class="btn btn-no" id="btnStop" onclick="act('/api/stop','正在停止')" disabled>
+                    <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>停止
+                  </button>
+                  <button class="btn btn-warn" id="btnRestart" onclick="act('/api/restart','正在重启')" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>重启
+                  </button>
+                </div>
+              </div>
               <div class="svc off" id="cardDb">
                 <div class="svc-top">
                   <div class="svc-name">
@@ -999,18 +1094,6 @@
                 </div>
               </div>
             </div>
-            <div class="btns" style="margin-top:14px">
-              <!-- 三个控制按钮首屏均默认禁用，/api/status 返回后按服务实际状态启用 -->
-              <button class="btn btn-go" id="btnStart" onclick="startCheckAndAct()" disabled>
-                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>启动
-              </button>
-              <button class="btn btn-no" id="btnStop" onclick="act('/api/stop','正在停止')" disabled>
-                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>停止
-              </button>
-              <button class="btn btn-warn" id="btnRestart" onclick="act('/api/restart','正在重启')" disabled>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>重启
-              </button>
-            </div>
           </div>
         </div>
 
@@ -1019,7 +1102,8 @@
           <div class="card-head">
             <span class="card-title" id="logCardTitle">实时日志</span>
             <div style="display:flex;align-items:center;gap:10px">
-              <button class="btn btn-sm" onclick="clearLog()">清除</button>
+              <button class="btn btn-sm btn-copy-log" onclick="copyLog(this)">复制</button>
+              <button class="btn btn-sm btn-clear-log" onclick="clearLog()">清除</button>
               <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
                 <label class="toggle-switch" id="streamToggle">
                   <input type="checkbox" id="streamToggleInput" onchange="toggleStreaming()">
@@ -1028,6 +1112,45 @@
                 </label>
                 <span id="streamToggleLabel" style="font-size:12px;color:var(--text2);white-space:nowrap"></span>
               </div>
+            </div>
+          </div>
+          <div class="log-filter" id="logFilter">
+            <div class="log-filter-row">
+              <span class="log-filter-group">
+                <span class="log-filter-label">来源</span>
+                <button class="si-file-btn active" data-log-source="monitor" onclick="setLogSource('monitor')">Monitor</button>
+                <button class="si-file-btn" data-log-source="agent" onclick="setLogSource('agent')">AGENT</button>
+                <button class="si-file-btn" data-log-source="gateway" onclick="setLogSource('gateway')">GATEWAY</button>
+                <button class="si-file-btn" data-log-source="error" onclick="setLogSource('error')">ERRORS</button>
+                <button class="si-file-btn" data-log-source="install" onclick="setLogSource('install')">INFO</button>
+                <button class="si-file-btn" data-log-source="all" onclick="setLogSource('all')">全部</button>
+              </span>
+              <span class="log-filter-group">
+                <span class="log-filter-label">组件</span>
+                <button class="si-file-btn active" data-log-comp="all" onclick="setLogComponent('all')">ALL</button>
+                <button class="si-file-btn" data-log-comp="gateway" onclick="setLogComponent('gateway')">GATEWAY</button>
+                <button class="si-file-btn" data-log-comp="agent" onclick="setLogComponent('agent')">AGENT</button>
+                <button class="si-file-btn" data-log-comp="tools" onclick="setLogComponent('tools')">TOOLS</button>
+                <button class="si-file-btn" data-log-comp="cli" onclick="setLogComponent('cli')">CLI</button>
+                <button class="si-file-btn" data-log-comp="cron" onclick="setLogComponent('cron')">CRON</button>
+              </span>
+            </div>
+            <div class="log-filter-row">
+              <span class="log-filter-group">
+                <span class="log-filter-label">级别</span>
+                <button class="si-file-btn active" data-log-level="all" onclick="setLogLevel('all')">ALL</button>
+                <button class="si-file-btn" data-log-level="debug" onclick="setLogLevel('debug')">DEBUG</button>
+                <button class="si-file-btn" data-log-level="info" onclick="setLogLevel('info')">INFO</button>
+                <button class="si-file-btn" data-log-level="warning" onclick="setLogLevel('warning')">WARNING</button>
+                <button class="si-file-btn" data-log-level="error" onclick="setLogLevel('error')">ERROR</button>
+              </span>
+              <span class="log-filter-group">
+                <span class="log-filter-label">行数</span>
+                <button class="si-file-btn" data-log-lines="50" onclick="setLogLines(50)">50</button>
+                <button class="si-file-btn active" data-log-lines="100" onclick="setLogLines(100)">100</button>
+                <button class="si-file-btn" data-log-lines="200" onclick="setLogLines(200)">200</button>
+                <button class="si-file-btn" data-log-lines="500" onclick="setLogLines(500)">500</button>
+              </span>
             </div>
           </div>
           <div class="log-box overview-log-box" id="logBox"><div class="log-empty">等待日志…</div></div>
@@ -1095,9 +1218,6 @@
                 <div id="appLatestVer" style="font-size:14px;font-weight:700;letter-spacing:-0.3px;color:var(--text3)">未获取</div>
               </div>
             </div>
-            <div style="display:flex;gap:8px;margin-top:16px;align-items:center">
-              <span id="appUpdateFlag" style="display:none;font-size:12px;color:var(--orange)">发现新版本，可前往下载</span>
-            </div>
           </div>
         </div>
 
@@ -1123,6 +1243,7 @@
             <div style="display:flex;gap:8px;margin-top:16px;align-items:center">
               <button class="btn" id="checkUpdateBtn" onclick="checkHermesUpdate()" style="font-size:13px">检查更新</button>
               <button class="btn" id="doUpdateBtn" onclick="confirmHermesUpdate()" style="display:none;font-size:13px;background:var(--accent);color:#fff;border:none">更新</button>
+              
               <span class="qq-group-wrap" onmouseenter="showQQGroup()" onmouseleave="hideQQGroup()">
                 <button type="button" class="qq-group-btn" onclick="toggleQQGroup(event)" aria-label="QQ 交流群">
                   <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
@@ -1137,7 +1258,7 @@
             <!-- 更新进度 -->
             <div id="updateProgress" style="display:none;margin-top:16px">
               <div style="font-size:12px;color:var(--text3);margin-bottom:6px" id="updateStatusText">更新中…</div>
-              <pre style="background:var(--bg2);border-radius:6px;padding:10px 12px;font-size:11px;max-height:240px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2);line-height:1.5;font-family:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace" id="updateLogOutput"></pre>
+              <pre style="background:#1a1b23;border:1px solid #2a2b35;border-radius:6px;padding:10px 12px;font-size:11px;max-height:240px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:#e0e0e0;line-height:1.5;font-family:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace" id="updateLogOutput"></pre>
             </div>
           </div>
         </div>
@@ -1324,6 +1445,7 @@
 
 <div class="img-zoom-backdrop" id="imgZoomBackdrop"><img id="zoomImg" src="" alt=""></div>
 
+
 <script>
 (function(){
   // ─── 主题 ───
@@ -1431,6 +1553,43 @@
     });
   }
 
+  // ─── 诊断模式支持（仅在 monitor.js 加载失败时启用）───────────────────
+  // 页面初始化时检测 /api/status 是否返回 error:"monitor not loaded" 或 HTTP 503
+  // 若判定为诊断模式，则动态注入诊断导航项并开启相关功能；Monitor 正常工作时一切如常
+  var diagnoseMode = false;
+  // 严格模式检测：避免网络/重启导致的误触发
+  function checkDiagnoseMode(){
+    fetch(apiUrl('/api/status'), { cache:'no-store' })
+      .then(function(r){
+        var status = r.status;
+        return r.text().then(function(text){
+          var json;
+          try{ json = JSON.parse(text); }catch(e){}
+          // 严格判定：必须同时满足 HTTP 503 + JSON 中 error 字段精确为 "monitor not loaded"
+          if(status === 503 && json && json.error === 'monitor not loaded'){
+            diagnoseMode = true;
+            injectDiagNavItem();
+          }
+        });
+      }).catch(function(){});
+  }
+  // 动态注入诊断导航项（仅诊断模式），放在更新按钮之后
+  // 进入诊断模式时先给 body 加禁用类，只开放诊断相关元素
+  function injectDiagNavItem(){
+    var navItems = document.querySelector('.nav-items');
+    if(!navItems) return;
+    // 给 body 加上禁用类（全局灰显）
+    document.body.classList.add('diagnose-lock');
+    // 创建跳转链接（指向 /app/hermes-agent/debug 专用诊断页面）
+    var diagLink = document.createElement('a');
+    diagLink.className = 'nav-item nav-diag-alert';
+    diagLink.id = 'navDiagBtn';
+    diagLink.href = '/app/hermes-agent/debug';
+    diagLink.target = '_blank';
+    diagLink.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M10.68 11.02a3 3 0 1 1 .02-5.98 3 3 0 0 1-.02 5.98z"/><path d="M12 13a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg>' + '<span class="nav-label">诊断</span>';
+    // 插入到最后一个导航项之后（更新按钮后面）
+    navItems.appendChild(diagLink);
+  }
   // ─── 视图切换 ───
   window.switchView = function(view){
     // 切换视图时关闭仍打开的「添加/编辑模型」弹窗，避免手机端切到概览/更新后弹窗仍浮在页面上
@@ -1445,10 +1604,8 @@
     if(nav) nav.classList.add('active');
     document.querySelectorAll('.mobile-nav-btn').forEach(function(n){ n.classList.toggle('active', n.getAttribute('data-view') === view); });
     if(view !== 'chat'){
-      var _drawer = document.getElementById('chatSessions');
-      var _overlay = document.getElementById('chatOverlay');
-      if(_drawer) _drawer.classList.remove('open');
-      if(_overlay) _overlay.classList.remove('open');
+      // 切换到非对话视图时：仅关闭抽屉，不使用 toggle
+      closeChatDrawer();
     }
     if (window.__deepLinked) { window.__deepLinked = false; } else {
       try { localStorage.setItem('hermes_view', view); } catch(e){}
@@ -1483,18 +1640,11 @@
       logStreaming = false;
       document.getElementById('streamToggleInput').checked = false;
       updateStreamUI();
-      // 从本地存储恢复上次查看的日志文件
-      var savedFile = null;
-      try { savedFile = localStorage.getItem('hermes_log_file'); } catch(e){}
-      if(savedFile){
-        logViewFile(savedFile);
-        refreshSysInfoDelayed();
-      } else {
-        loadLogHistory().then(function(){ refreshSysInfoDelayed(); });
-      }
+      // 进入概览页时默认加载 Monitor 日志
+      setLogSource('monitor');
+      refreshSysInfoDelayed();
     } else {
-      if(es){ stopStream(); }
-      if(logFileInterval){ clearInterval(logFileInterval); logFileInterval = null; }
+      stopLogRefresh();
     }
   };
 
@@ -1697,102 +1847,184 @@
     });
   }
 
-  function addLog(text){
-    if(firstLog){ logBox.innerHTML = ''; firstLog = false; }
-    var d = document.createElement('div');
-    d.className  = 'log-line';
-    if (/spawned|started|starting|listening|bound|connected|running/i.test(text)) d.className += ' log-start';
-    else if (/stopped|killed|stopping|shutdown|terminated|disconnected|exited|closed/i.test(text)) d.className += ' log-stop';
-    else if (/error|fatal|fail|unhealthy|EADDRINUSE|refused|timeout|crash/i.test(text)) d.className += ' log-error';
-    else if (/ready|healthy|success|ok|✓|paired/i.test(text)) d.className += ' log-ready';
-    else if (/warn|deprecated|retry|pending/i.test(text)) d.className += ' log-warn';
-    d.textContent = text;
-    var atTop = logBox.scrollTop < 20;
-    logBox.insertBefore(d, logBox.firstChild);
-    if (!atTop) logBox.scrollTop += d.offsetHeight;
-    while(logBox.children.length > 500) logBox.removeChild(logBox.lastChild);
-  }
-
-  function clearLog(){
-    var file = (logViewMode === 'file') ? logCurrentFile : 'hermes.log';
-    api('/api/logs/clear', 'POST', {file: file}).then(function(){
-      logBox.innerHTML = '';
-      firstLog = true;
-      addLog('[ 日志已清除 ]');
-      if(logViewMode === 'file' && logCurrentFile){
-        loadLogFile(logCurrentFile, true);
-      }
-      // 重置 SSE offset，避免清除后偏移量失效
-      logOffset = 0;
-    }).catch(function(){
-      // 如果 API 失败，仍然清除前端显示并提示
-      logBox.innerHTML = '';
-      firstLog = true;
-      addLog('[ 服务端清除失败，仅清除本地显示 ]');
-    });
-  }
-
-  var es = null;
-  var logOffset = -1;
+  // ── 日志查看器状态：来源 / 级别 / 组件 ──
+  var _logState = {
+    source: 'monitor',
+    level: 'all',
+    component: 'all',
+    lines: 100,
+    rawLines: [],
+    titleMap: { monitor:'Monitor 日志', agent:'Agent 日志', gateway:'Gateway 日志', error:'错误日志', gui:'GUI 日志', install:'INFO 日志', all:'全部日志' },
+    fileMap: { monitor:'monitor.log', agent:'agent.log', gateway:'gateway.log', error:'errors.log', gui:'gui.log', install:'info.log' },
+    sourceFiles: {
+      monitor:['monitor'], agent:['agent'], gateway:['gateway'], error:['error'], gui:['gui'], install:['install'],
+      all:['monitor','agent','gateway','error','gui']
+    }
+  };
   var logStreaming = false;
-  var reconnectTimer = null;
+  var logRefreshInterval = null;
 
-  function startStream(){
-    if(es) es.close();
-    if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
-    var url = apiUrl('/api/logs');
-    if (logOffset >= 0) url += '?offset=' + logOffset;
-    es = new EventSource(url);
-    es.addEventListener('log', function(e){
-      if(e.data) {
-        addLog(e.data);
-        logOffset += new Blob([e.data + '\n']).size;
-      }
+  // 选择日志来源并重新拉取
+  window.setLogSource = function(s){ _logState.source = s || 'monitor'; applyLogFilters(true); };
+  // 选择级别，在已拉取数据上即时过滤
+  window.setLogLevel = function(l){ _logState.level = l || 'all'; applyLogFilters(false); };
+  // 选择组件，在已拉取数据上即时过滤
+  window.setLogComponent = function(c){ _logState.component = c || 'all'; applyLogFilters(false); };
+  // 选择显示行数，需要重新拉取（行数决定后端返回条数）
+  window.setLogLines = function(n){ _logState.lines = n || 100; applyLogFilters(true); };
+
+  function applyLogFilters(refetch){
+    updateLogFilterUI();
+    if(refetch){ fetchLogLines(); return; }
+    renderLogLines();
+  }
+
+  // 同步过滤按钮的选中状态
+  function updateLogFilterUI(){
+    document.querySelectorAll('[data-log-source]').forEach(function(b){ b.classList.toggle('active', b.getAttribute('data-log-source')===_logState.source); });
+    document.querySelectorAll('[data-log-level]').forEach(function(b){ b.classList.toggle('active', b.getAttribute('data-log-level')===_logState.level); });
+    document.querySelectorAll('[data-log-comp]').forEach(function(b){ b.classList.toggle('active', b.getAttribute('data-log-comp')===_logState.component); });
+    document.querySelectorAll('[data-log-lines]').forEach(function(b){ b.classList.toggle('active', Number(b.getAttribute('data-log-lines'))===Number(_logState.lines)); });
+  }
+
+  // 拉取当前来源对应文件的日志
+  function fetchLogLines(){
+    var title = document.getElementById('logCardTitle');
+    if(title) title.textContent = _logState.titleMap[_logState.source] || '日志';
+    if(logBox) logBox.innerHTML = '<div class="log-empty">加载日志中…</div>';
+    var files = _logState.sourceFiles[_logState.source] || [_logState.source];
+    var pending = files.length;
+    var all = [];
+    files.forEach(function(tag){
+      var file = _logState.fileMap[tag] || 'monitor.log';
+      api('/api/logs/read?file='+encodeURIComponent(file)+'&lines='+encodeURIComponent(_logState.lines)).then(function(d){
+        (d && d.lines || []).forEach(function(l){ all.push({ tag: tag, line: l }); });
+      }).catch(function(){}).then(function(){
+        pending--;
+        if(pending===0){ _logState.rawLines = all; renderLogLines(); }
+      });
     });
-    es.addEventListener('heartbeat', function(){});
-    es.onerror = function(){
-      es.close(); es = null;
-      if(logStreaming) reconnectTimer = setTimeout(startStream, 3000);
-    };
   }
 
-  function stopStream(){
-    if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
-    if(es){ es.close(); es = null; }
+  // 从日志行文本识别级别
+  function detectLogLevel(line){
+    var m = String(line).match(/\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b/i);
+    if(!m) return '';
+    var lvl = m[1].toLowerCase();
+    if(lvl==='warn') return 'warning';
+    if(lvl==='critical' || lvl==='fatal') return 'error';
+    return lvl;
   }
 
-  window.toggleStreaming = function(){
-    logStreaming = document.getElementById('streamToggleInput').checked;
-    updateStreamUI();
-    if(logStreaming){
-      if(logViewMode === 'file' && logCurrentFile){
-        if(logFileInterval) clearInterval(logFileInterval);
-        logFileInterval = setInterval(function(){ loadLogFile(logCurrentFile, false); }, 5000);
-      } else {
-        startStream();
+  // 从日志行文本识别来源组件
+  function detectLogComponent(line){
+    var s = String(line);
+    var m = s.match(/\b(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\s+([a-zA-Z0-9_\.]+)/i);
+    var logger = m ? m[1].toLowerCase() : '';
+    if(logger.indexOf('gateway')>=0) return 'gateway';
+    if(logger.indexOf('agent')>=0) return 'agent';
+    if(logger.indexOf('cron')>=0) return 'cron';
+    if(logger.indexOf('cli')>=0 || logger.indexOf('hermes_cli')>=0) return 'cli';
+    if(logger.indexOf('tool')>=0 || /\b(tool_|plugin|mcp)\b/i.test(s)) return 'tools';
+    return '';
+  }
+
+  // 级别到 CSS 类的映射
+  var _logLevelClass = { error:'log-error', warning:'log-warn', info:'log-info', debug:'log-debug' };
+
+  // 按级别与组件过滤后渲染，最新日志在上并按级别着色
+  function renderLogLines(){
+    if(!logBox) return;
+    var title = document.getElementById('logCardTitle');
+    if(title) title.textContent = _logState.titleMap[_logState.source] || '日志';
+    var filtered = _logState.rawLines.filter(function(item){
+      var lvl = detectLogLevel(item.line);
+      var comp = detectLogComponent(item.line) || item.tag;
+      if(_logState.level!=='all' && lvl!==_logState.level) return false;
+      if(_logState.component!=='all' && comp!==_logState.component) return false;
+      return true;
+    });
+    if(!filtered.length){ logBox.innerHTML = '<div class="log-empty">无匹配日志</div>'; logBox.scrollTop = 0; firstLog = true; return; }
+    var html = '<div class="log-lines">';
+    for(var i=filtered.length-1; i>=0; i--){
+      var line = filtered[i].line;
+      var lvl = detectLogLevel(line);
+      var cls = 'log-line' + (_logLevelClass[lvl] ? ' '+_logLevelClass[lvl] : '');
+      html += '<div class="'+cls+'">'+escapeHtml(String(line))+'</div>';
+    }
+    html += '</div>';
+    logBox.innerHTML = html;
+    logBox.scrollTop = 0;
+    firstLog = false;
+  }
+
+  // 清空当前来源对应的日志文件，全部来源时清空所有真实文件
+  function clearLog(){
+    var files = _logState.sourceFiles[_logState.source] || [_logState.source];
+    files.forEach(function(tag){
+      var file = _logState.fileMap[tag] || 'monitor.log';
+      api('/api/logs/clear', 'POST', { file: file }).catch(function(){});
+    });
+    _logState.rawLines = [];
+    if(logBox) logBox.innerHTML = '<div class="log-empty">日志已清除</div>';
+    firstLog = true;
+  }
+
+  // 复制当前日志框里展示的内容（取渲染出的 .log-line 行文本）；
+  // 本页经 fnOS 反代多为 http（非安全上下文），navigator.clipboard 可能不可用，因此保留 execCommand 兑底。
+  function _copyFallback(text, done){
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly','');
+      ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.left = '0'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      done && done();
+    }catch(e){}
+  }
+  window.copyLog = function(btn){
+    var text = '';
+    if(logBox){
+      var lines = logBox.querySelectorAll('.log-line');
+      if(lines && lines.length){
+        var arr = [];
+        for(var i=0;i<lines.length;i++){ arr.push(lines[i].innerText); }
+        text = arr.join('\n');
       }
+    }
+    if(!text){ return; } // 空日志（等待/已清除占位）不复制
+    var done = function(){
+      if(!btn) return;
+      btn.textContent = '已复制';
+      btn.classList.add('copied');
+      clearTimeout(btn._copyTimer);
+      btn._copyTimer = setTimeout(function(){ btn.textContent = '复制'; btn.classList.remove('copied'); }, 1500);
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done).catch(function(){ _copyFallback(text, done); });
     } else {
-      stopStream();
-      if(logFileInterval){ clearInterval(logFileInterval); logFileInterval = null; }
+      _copyFallback(text, done);
     }
   };
 
-  function updateStreamUI(){
-    var title = document.getElementById('logCardTitle');
-    if(title && logViewMode === 'stream') title.textContent = '实时日志';
-    var label = document.getElementById('streamToggleLabel');
-    if(label) label.textContent = logStreaming ? '关闭刷新' : '开启刷新';
+  // 刷新开关：开启后定时重新拉取当前来源
+  window.toggleStreaming = function(){
+    logStreaming = document.getElementById('streamToggleInput').checked;
+    updateStreamUI();
+    stopLogRefresh();
+    if(logStreaming){
+      logRefreshInterval = setInterval(fetchLogLines, 5000);
+    }
+  };
+
+  function stopLogRefresh(){
+    if(logRefreshInterval){ clearInterval(logRefreshInterval); logRefreshInterval = null; }
   }
 
-  function loadLogHistory(){
-    return api('/api/logs/history').then(function(d){
-      if(d && d.lines && d.lines.length > 0){
-        logBox.innerHTML = '';
-        firstLog = false;
-        d.lines.forEach(function(l){ addLog(l); });
-        if(d.fileSize !== undefined) logOffset = d.fileSize;
-      }
-    }).catch(function(){});
+  function updateStreamUI(){
+    var label = document.getElementById('streamToggleLabel');
+    if(label) label.textContent = logStreaming ? '关闭刷新' : '开启刷新';
   }
 
   // ═══════════════════════════════════════════════
@@ -1808,23 +2040,21 @@
       if(!document.getElementById('viewOverview') || !document.getElementById('viewOverview').classList.contains('active')) return;
       var mem = s.memoryKB ? Math.round(s.memoryKB/1024)+' MB' : '--';
       var up = s.uptime || '--';
-      var logs = s.logFiles || [];
 
       if(!window._sysInfoRendered){
         window._sysInfoRendered = true;
         var html = '<div class="svc-detail" style="align-items:flex-start;gap:8px;font-size:12px;flex-direction:column">';
+        // 第一行：运行时间 + 内存
         html += '<div class="svc-d-item">';
         html += '<span class="svc-d-label">运行</span><span class="svc-d-val" id="siUptime">'+up+'</span>';
         html += '<span class="svc-d-label" style="margin-left:8px">内存</span><span class="svc-d-val" id="siMem">'+mem+'</span>';
         html += '</div>';
+        // 第二行：版本 + CPU（如有）
         html += '<div class="svc-d-item" style="margin-top:2px">';
         html += '<span class="svc-d-label">版本</span><span class="svc-d-val" id="hermesVersion">--</span>';
-        html += '</div>';
-        html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px" id="siLogBtns">';
-        logs.forEach(function(f){
-          var active = (logViewMode === 'file' && logCurrentFile === f.name) ? ' active' : '';
-          html += '<button class="si-file-btn'+active+'" onclick="logViewFile(\''+f.name+'\')">'+f.label+'</button>';
-        });
+        if(s.cpuPercent !== undefined) {
+          html += '<span class="svc-d-label" style="margin-left:8px">CPU</span><span class="svc-d-val" id="siCpu">'+s.cpuPercent+'%</span>';
+        }
         html += '</div>';
         body.innerHTML = html;
         return;
@@ -1834,58 +2064,10 @@
       var memEl = document.getElementById('siMem');
       if(upEl) upEl.textContent = up;
       if(memEl) memEl.textContent = mem;
+      // 新增：动态更新 CPU
+      var cpuEl = document.getElementById('siCpu');
+      if(cpuEl && s.cpuPercent !== undefined) cpuEl.textContent = s.cpuPercent+'%';
     }).catch(function() {});
-  }
-
-  // ── 日志文件查看状态 ──
-  var logViewMode = 'file'; // 'stream' | 'file'
-  var logCurrentFile = 'hermes.log';
-  var logFileInterval = null;
-
-  window.logViewFile = function(name){
-    logViewMode = 'file';
-    logCurrentFile = name;
-    try { localStorage.setItem('hermes_log_file', name); } catch(e){}
-    if(logFileInterval){ clearInterval(logFileInterval); logFileInterval = null; }
-    if(es){ es.close(); es = null; }
-    // 更新卡片标题以显示文件名
-    var title = document.getElementById('logCardTitle');
-    if(title) title.textContent = name;
-    updateStreamUI();
-    // 更新系统信息卡片中按钮的激活状态
-    var btns = document.querySelectorAll('#siLogBtns .si-file-btn');
-    btns.forEach(function(b){ b.classList.remove('active'); });
-    var activeBtn = document.querySelector('#siLogBtns .si-file-btn[onclick*="'+name+'"]');
-    if(activeBtn) activeBtn.classList.add('active');
-    loadLogFile(name, true);
-    // 仅在用户开启刷新开关时才启动 5 秒轮询
-    if(logStreaming){
-      if(logFileInterval) clearInterval(logFileInterval);
-      logFileInterval = setInterval(function(){ loadLogFile(name, false); }, 5000);
-    }
-  };
-
-  function loadLogFile(name, clear){
-    api('/api/logs/read?file='+encodeURIComponent(name)).then(function(d){
-      var box = document.getElementById('logBox');
-      var lines = d.lines || [];
-      // 最新日志在上
-      var html = '<div class="log-lines">';
-      for(var i=lines.length-1; i>=0; i--){
-        var l = lines[i];
-        var cls = 'log-line';
-        if (/error|fatal|fail|unhealthy|EADDRINUSE|refused|timeout|crash/i.test(l)) cls += ' log-error';
-        else if (/ready|healthy|success|ok|✓|paired|started|spawned/i.test(l)) cls += ' log-ready';
-        else if (/warn|deprecated|retry/i.test(l)) cls += ' log-warn';
-        else if (/stopped|killed|shutdown|terminated|exited/i.test(l)) cls += ' log-stop';
-        html += '<div class="'+cls+'">'+escapeHtml(l)+'</div>';
-      }
-      html += '</div>';
-      box.innerHTML = html;
-      firstLog = false;
-    }).catch(function(){
-      document.getElementById('logBox').innerHTML = '<div style="color:#f85149;font-size:12px;padding:8px">读取失败</div>';
-    });
   }
 
   // ═══════════════════════════════════════════════
@@ -2009,6 +2191,13 @@
     }
 
     return out;
+  }
+
+  // ── 处理时长格式化：<60s 显示 "Ns"，≥60s 显示 "Nm Ns"（例 1m 30s） ──────────
+  function fmtElapsed(secs){
+    secs = Math.max(0, Math.floor(secs));
+    if(secs < 60) return secs + 's';
+    return Math.floor(secs/60) + 'm ' + (secs%60) + 's';
   }
 
   // ── 裸 URL → Markdown 链接预处理 ────────────────────────────────────────────
@@ -2315,6 +2504,13 @@
     if(ov) ov.classList.toggle('open', open);
   }
 
+  // 仅关闭抽屉（不 toggle），供点击会话项/新建会话等场景调用
+  function closeChatDrawer(){
+    var _d0 = document.getElementById('chatSessions');
+    var _o0 = document.getElementById('chatOverlay');
+    if(_d0 && _d0.classList.contains('open')){ _d0.classList.remove('open'); if(_o0) _o0.classList.remove('open'); }
+  }
+
   function chatInit(){
     if(chatState.inited) return;
     chatState.inited = true;
@@ -2338,6 +2534,8 @@
     chatLoadSessions().then(function(){
       // 页面加载/刷新后恢复运行中会话的状态徽章与实时画面
       chatRestoreActiveRuns();
+      // 启动后台心跳：页面已开着时也能自动感知其他窗口新发起的运行中会话（无需刷新）
+      chatStartHeartbeat();
       // 恢复当前会话的输入草稿
       if(chatState.currentId) tabRestoreDraft(chatState.currentId);
     }).catch(function(){
@@ -2546,16 +2744,21 @@
 
   function chatSwitchSession(id, closeDrawer){
     var prev = chatState.currentId;
-    if(prev && prev !== id && chatRuns[prev]){
+    if(prev && prev !== id && chatRuns[prev]){ 
       // 离开旧会话：其流式 DOM 即将被销毁；本页 WS 仍在后台接收（wsLive 保持），仅停 /live 轮询
       chatStopLivePoll(prev);
       chatRuns[prev].liveEls = null;
     }
     chatState.currentId = id;
     try { sessionStorage.setItem('hermes_chat_session', id); } catch(e){}
-    if(closeDrawer !== false) toggleChatSessions();
+    if(closeDrawer !== false) closeChatDrawer();
     var run = chatRun(id);
     run.unread = false;
+    //【跨窗口实时流转】如果这是后台轮询累积过的运行中会话，在重渲染前先启动 live 模式
+    if(run.status === 'running' && (run.liveText || run.liveToolMap.size > 0) && !run.polling){
+      console.log('[会话切换] 检测到后台累积内容，立即启动轮询:', id, 'liveText len=', run.liveText.length, 'tools=', run.liveToolMap.size);
+      chatResumeLive(id);
+    }
     var box = document.getElementById('chatMessages');
     if(box) box.innerHTML = '';
     // 清理上一个会话残留的全局流式 UI；切入运行中会话时恢复顶部进度条（宽度按运行起始时间推算）
@@ -2704,7 +2907,8 @@
       chatState.currentId = s.id;
       try { sessionStorage.setItem('hermes_chat_session', s.id); } catch(e){}
       if(_openTabs.indexOf(s.id) === -1){ _openTabs.push(s.id); tabPersist(); }
-      toggleChatSessions();
+      // 新建对话后仅关闭抽屉（不 toggle），避免误开
+      closeChatDrawer();
       var box = document.getElementById('chatMessages');
       if(box) box.innerHTML =
         '<div class="chat-empty"><h2>Hermes Chat</h2><p>开始新的对话…</p>' +
@@ -2741,14 +2945,82 @@
       var title = sessTitle(s.title);
       var run = chatRuns[sid];
       var streaming = !!(run && run.status === 'running');
-      html += '<div class="session-tab' + (active ? ' active' : '') + (streaming ? ' streaming' : '') + '" data-sid="' + sid + '" title="' + escapeHtml(title) + '" onclick="tabSwitch(\'' + sid + '\')">' +
+      html += '<div class="session-tab' + (active ? ' active' : '') + (streaming ? ' streaming' : '') + '" draggable="true" data-sid="' + sid + '" title="' + escapeHtml(title) + '" onclick="tabSwitch(\'' + sid + '\')">' +
         '<span class="tab-dot"></span>' +
         '<span class="tab-title">' + escapeHtml(title) + '</span>' +
         '<span class="tab-close" onclick="event.stopPropagation();tabClose(\'' + sid + '\')" title="关闭标签">×</span></div>';
     });
     scroll.innerHTML = html;
+    setupTabDnd(scroll);
     var activeEl = scroll.querySelector('.session-tab.active');
     if(activeEl) try { activeEl.scrollIntoView({block:'nearest',inline:'nearest'}); } catch(e){}
+  }
+
+  /* 标签拖拽重排：拖动时以指示线标出落脚点，松开后按目标位置重建 _openTabs 并持久化 */
+  var _tabDndBound = false;
+  var _tabDropInd = null;
+  function getTabDropIndicator(){
+    if(!_tabDropInd){
+      _tabDropInd = document.createElement('div');
+      _tabDropInd.className = 'tab-drop-indicator';
+    }
+    return _tabDropInd;
+  }
+  function clearTabDropIndicator(){
+    if(_tabDropInd && _tabDropInd.parentNode) _tabDropInd.parentNode.removeChild(_tabDropInd);
+  }
+  function setupTabDnd(scroll){
+    if(_tabDndBound) return; // 容器不变，事件仅绑定一次，避免重复注册
+    _tabDndBound = true;
+    // 鼠标悬停在标签栏上滚动纵向滚轮即左右滑动（仅当有横向溢出时接管）
+    scroll.addEventListener('wheel', function(e){
+      if(scroll.scrollWidth <= scroll.clientWidth) return;
+      var delta = e.deltaY || e.deltaX;
+      if(!delta) return;
+      e.preventDefault();
+      scroll.scrollLeft += delta;
+    }, { passive: false });
+    // 根据鼠标横坐标定位应插入到哪个未拖动标签之前（返回 null 表示追加到末尾）
+    function afterEl(x){
+      var els = Array.prototype.slice.call(scroll.querySelectorAll('.session-tab:not(.dragging)'));
+      var closest = { offset: -Infinity, el: null };
+      els.forEach(function(child){
+        var box = child.getBoundingClientRect();
+        var offset = x - box.left - box.width / 2;
+        if(offset < 0 && offset > closest.offset) closest = { offset: offset, el: child };
+      });
+      return closest.el;
+    }
+    scroll.addEventListener('dragstart', function(e){
+      var tab = e.target.closest ? e.target.closest('.session-tab') : null;
+      if(!tab) return;
+      tab.classList.add('dragging');
+      if(e.dataTransfer){ e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', tab.getAttribute('data-sid') || ''); } catch(_){} }
+    });
+    scroll.addEventListener('dragover', function(e){
+      var dragging = scroll.querySelector('.session-tab.dragging');
+      if(!dragging) return;
+      e.preventDefault();
+      if(e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      // 先移除指示线再测量，避免其自身宽度干扰 afterEl 的中点计算导致抖动
+      var ind = getTabDropIndicator();
+      if(ind.parentNode) ind.parentNode.removeChild(ind);
+      var ref = afterEl(e.clientX);
+      if(ref == null) scroll.appendChild(ind);
+      else scroll.insertBefore(ind, ref);
+    });
+    scroll.addEventListener('drop', function(e){ e.preventDefault(); });
+    scroll.addEventListener('dragend', function(){
+      var dragging = scroll.querySelector('.session-tab.dragging');
+      if(!dragging){ clearTabDropIndicator(); return; }
+      // 按指示线位置把拖动标签落位，再清除指示线
+      if(_tabDropInd && _tabDropInd.parentNode === scroll) scroll.insertBefore(dragging, _tabDropInd);
+      dragging.classList.remove('dragging');
+      clearTabDropIndicator();
+      // 按当前 DOM 顺序重建 _openTabs，并持久化到 localStorage（复用现有 hermes_open_tabs）
+      var order = Array.prototype.slice.call(scroll.querySelectorAll('.session-tab')).map(function(el){ return el.getAttribute('data-sid'); });
+      if(order.length){ _openTabs = order; tabPersist(); }
+    });
   }
 
   /* 草稿：切走时保存、切回时恢复 */
@@ -2774,7 +3046,13 @@
 
   /* 切换到指定标签 */
   window.tabSwitch = function(sid){
-    if(!sid || sid === chatState.currentId) return;
+    if(!sid || sid === chatState.currentId){
+      // 即便点击的是当前会话，也应关闭已打开的抽屉
+      closeChatDrawer();
+      return;
+    }
+    // 先关闭抽屉，确保无论后续操作如何都能成功
+    closeChatDrawer();
     tabSaveDraft(chatState.currentId);
     chatSwitchSession(sid, false);
     tabRestoreDraft(sid);
@@ -3147,7 +3425,7 @@
         var pct = Math.min(95, elapsed / _MAX_MS * 100);
         if(timeoutFill) timeoutFill.style.width = pct + '%';
         var secs = Math.floor(elapsed / 1000);
-        var _msg = elapsed < 3000 ? '正在思考' : (elapsed < 10000 ? ('思考中 '+secs+'s') : ('处理中 '+secs+'s'));
+        var _msg = elapsed < 3000 ? '正在思考' : (elapsed < 10000 ? ('思考中 '+fmtElapsed(secs)) : ('处理中 '+fmtElapsed(secs)));
         if(statusBar) statusBar.textContent = _msg;
       }, 500);
 
@@ -3577,7 +3855,29 @@
   // 时序：历史已加载 → cursor=0 拉全量运行缓存 → done=false 则 800ms 轮询 → done=true 停止
   function chatResumeLive(sessionId){
     var r = chatRun(sessionId);
-    if(r.polling) return;
+    if(r.polling){
+      // 后台已在轮询该会话：若已切为当前会话但实时 DOM 未挂载，
+      // 立即把已累积内容渲染出来（否则只能等下一次 poll，表现为“只有状态无内容”）；
+      // 后续增量由进行中的轮询继续驱动（isCurrent 已变真）
+      if(chatState.currentId === sessionId && !(r.liveEls && document.body.contains(r.liveEls.contentEl))){
+        var elsP = chatEnsureLiveEls(sessionId);
+        if(elsP){
+          if(r.liveText){
+            elsP.contentEl.innerHTML = renderMarkdown(r.liveText, true);
+            enhanceQrCodeBlocks(elsP.contentEl, r.liveText);
+            addCopyButtonsToPre(elsP.contentEl);
+            enhanceLinksWithQR(elsP.contentEl);
+            elsP.contentEl.classList.add('cursor-blink');
+          }
+          if(r.liveToolMap && r.liveToolMap.size){
+            elsP.progressDiv.classList.add('visible');
+            elsP.progressBody.innerHTML = chatLiveToolBadges(r.liveToolMap);
+          }
+          scrollChatToBottom(true);
+        }
+      }
+      return;
+    }
     if(r.wsLive){
       // 本页 WS 仍在接收该会话的流：若实时 DOM 仍挂载（仅切换导航视图，聊天 DOM 未销毁），
       // 直接复用，禁止重建，否则每次切回都会在窗口尾部追加一份重复气泡+工具徽章
@@ -3586,22 +3886,24 @@
       r.liveEls = null;
       var els = chatEnsureLiveEls(sessionId);
       if(els){
-        if(r.liveToolMap && r.liveToolMap.size){
-          els.progressDiv.classList.add('visible');
-          els.progressBody.innerHTML = chatLiveToolBadges(r.liveToolMap);
-        }
-        if(r.liveText){
+        // 【跨窗口实时流转】如果是后台轮询切换回来，先渲染已累积的内容
+        if(r.liveText && els.contentEl.innerHTML === ''){
           els.contentEl.innerHTML = renderMarkdown(r.liveText, true);
           enhanceQrCodeBlocks(els.contentEl, r.liveText);
           addCopyButtonsToPre(els.contentEl);
           enhanceLinksWithQR(els.contentEl);
           els.contentEl.classList.add('cursor-blink');
         }
+        if(r.liveToolMap && r.liveToolMap.size){
+          els.progressDiv.classList.add('visible');
+          els.progressBody.innerHTML = chatLiveToolBadges(r.liveToolMap);
+        }
         scrollChatToBottom(true);
       }
       return;
     }
-    if(r.status !== 'running') return;
+    // running：持续 800ms 轮询；complete：仅拉一次取最终态即停（覆盖 B 经 URL 打开时 A 刚结束的边界）
+    if(r.status !== 'running' && r.status !== 'complete') return;
     r.polling = true;
     r.cursor = 0;       // 切回时从头拉运行缓存（历史接口只含已持久化消息，运行中增量不在其中）
     r.toolCursor = 0;
@@ -3612,11 +3914,9 @@
     r.truncNoted = false;
     if(!r.startTime) r.startTime = Date.now();
     // 立即重建占位气泡（思考点动画）与顶部进度条，不等首个 /live 响应，消除指示空窗
-    if(chatState.currentId === sessionId){
-      chatEnsureLiveEls(sessionId);
-      var tbR = document.getElementById('chatTimeoutBar');
-      if(tbR) tbR.style.display = 'block';
-    }
+    // 跨窗口轮询：即使不是 currentId 也创建 DOM（允许后台显示实时内容）
+    var tbR = document.getElementById('chatTimeoutBar');
+    if(tbR) tbR.style.display = 'block';
     chatLivePollOnce(sessionId);
   }
 
@@ -3636,6 +3936,24 @@
     if(!box) return null;
     var empty = box.querySelector('.chat-empty');
     if(empty) empty.remove();
+    // 跨窗口流转：本轮用户提问可能尚未写入会话历史（B 加载到的是上一条），
+    // 用 liveRun 暴露的 prompt 补出当前提问气泡；与末条用户消息一致时不重复添加
+    if(r.livePrompt != null && r.livePrompt !== ''){
+      var pv = splitContentForDisplay(r.livePrompt);
+      var promptText = (pv.text || '').trim();
+      var normP = function(s){ return (s || '').replace(/\s+/g, ' ').trim(); };
+      var userEls = box.querySelectorAll('.message.user .msg-content');
+      var lastUserTxt = userEls.length ? userEls[userEls.length - 1].textContent : '';
+      if((promptText || (pv.images && pv.images.length)) && normP(lastUserTxt) !== normP(promptText)){
+        var uImg = (pv.images || []).map(function(u){
+          return '<img src="' + u + '" style="max-width:200px;max-height:200px;border-radius:8px;display:block;margin-top:6px;cursor:pointer">';
+        }).join('');
+        var uDiv = document.createElement('div');
+        uDiv.className = 'message user anim-in';
+        uDiv.innerHTML = '<div class="msg-role">你</div><div class="msg-content">' + escapeHtml(promptText).replace(/\n/g, '<br>') + uImg + '</div>';
+        box.appendChild(uDiv);
+      }
+    }
     var progressDiv = document.createElement('div');
     progressDiv.className = 'assistant-progress';
     progressDiv.innerHTML = '<div class="progress-body"></div>';
@@ -3717,6 +4035,9 @@
         });
         r.toolCursor = d.tool_cursor;
         r.status = d.done ? (d.status === 'running' ? 'complete' : d.status) : 'running';
+        // 跨窗口流转：记录本轮用户提问（后端 liveRun 与助手输出同源暴露），
+        // 供 chatEnsureLiveEls 补出当前提问气泡，避免 B 端把流式回复挂在旧问题下
+        if(d.prompt != null && d.prompt !== '') r.livePrompt = d.prompt;
 
         if(isCurrent){
           var els = chatEnsureLiveEls(sessionId);
@@ -3737,11 +4058,11 @@
           var sb = document.getElementById('chatStatusBar');
           if(sb && !r.truncNoted){
             if(d.done) sb.textContent = '';
-            else if(r.liveText) sb.textContent = 'Hermes 正在回复（已恢复实时对话）…';
+            else if(r.liveText) sb.textContent = 'Hermes 正在回复（已流转实时对话）…';
             else {
               // 尚无输出：显示思考计时，与 WS 路径的状态栏文案一致
               var secsP = r.startTime ? Math.floor((Date.now() - r.startTime) / 1000) : 0;
-              sb.textContent = secsP < 3 ? '正在思考' : (secsP < 10 ? ('思考中 ' + secsP + 's') : ('处理中 ' + secsP + 's'));
+              sb.textContent = secsP < 3 ? '正在思考' : (secsP < 10 ? ('思考中 ' + fmtElapsed(secsP)) : ('处理中 ' + fmtElapsed(secsP)));
             }
           }
           // 顶部进度条：运行中持续显示并按起始时间推进，结束时隐藏归零
@@ -3800,15 +4121,87 @@
           }
         });
         chatRenderSessions();
-        // 当前会话若在运行中，启动实时恢复：
-        // 先重渲染历史（此时 status 已置 running，会跳过末条 _streaming 半成品，
-        // 实时 DOM 仍挂载时内部直接早退不覆盖），再拉 /live 增量，避免同段内容双份
-        if(chatState.currentId && chatRuns[chatState.currentId] && chatRuns[chatState.currentId].status === 'running'){
+        // 当前会话若在运行中或已结束（但可能仍有输出）：无论 done 与否都尝试恢复轮询
+        // done=false 则持续 800ms 轮询；done=true 则立即拉一次取最终态然后停止
+        if(chatState.currentId && chatRuns[chatState.currentId]){
           var cid = chatState.currentId;
           chatUpdateComposer();
           chatRenderMessages().then(function(){ chatResumeLive(cid); });
         }
+        // 对其他所有 running 会话也启动轮询（新窗口可见实时流转）
+        (items || []).forEach(function(it){
+          if(!it || !it.session_id) return;
+          // 仅在开发环境输出，避免控制台噪音
+          if (/dev|localhost|local/.test(window.location.hostname)) {
+            console.debug('[跨窗口轮询] 候选会话:', it.session_id, 'done=', it.done, '当前 currentId=', chatState.currentId);
+          }
+          // 跳过已在上面处理的前台会话；仅对未结束的 running 会话启动轮询
+          if(it.session_id !== chatState.currentId && !it.done && chatRuns[it.session_id]){
+            if (/dev|localhost|local/.test(window.location.hostname)) {
+              console.debug('[跨窗口轮询] 启动后台轮询:', it.session_id);
+            }
+            // 非前台会话，启动 chatResumeLive()，内部会检查 DOM 是否需重建
+            chatResumeLive(it.session_id);
+          } else {
+            var reason = '';
+            if(it.session_id === chatState.currentId) reason = '跳过：当前激活会话';
+            else if(it.done) reason = '跳过：已结束';
+            else if(!chatRuns[it.session_id]) reason = '跳过：无运行对象';
+            if (/dev|localhost|local/.test(window.location.hostname)) {
+              console.debug('[跨窗口轮询]', it.session_id, reason);
+            }
+          }
+        });
       }).catch(function(){});
+  }
+
+  // ─── 多窗口：后台心跳，定期发现其他窗口新发起的运行中会话并自动流转───
+  // chatRestoreActiveRuns 只在页面加载时贑一次；本心跳补足“页面已开着时”的感知，
+  // 避免必须刷新才能看到另一窗口正在回复的内容。仅对 done=false 的会话启动轮询，
+  // 且跳过本窗口已在 WS 流/轮询的会话，不重复不加重服务器负担。
+  function chatActiveHeartbeat(){
+    // 标签页不可见时暂停，避免无意义轮询
+    if(document.hidden) return;
+    fetch(apiUrl('/api/chat/sessions/active'))
+      .then(function(r){ if(!r.ok) throw new Error(); return r.json(); })
+      .then(function(items){
+        var changed = false;
+        (items || []).forEach(function(it){
+          if(!it || !it.session_id) return;
+          var run = chatRun(it.session_id);
+          // 本窗口正在 WS 流式或轮询的会话：不覆盖状态、不重复启动
+          if(run.wsLive || run.polling) return;
+          var newStatus = it.done ? it.status : 'running';
+          if(run.status !== newStatus){ run.status = newStatus; changed = true; }
+          if(it.done){ run.doneAt = it.updated_at || run.doneAt || Date.now(); }
+          // 发现其他窗口新启动的运行中会话：启动流转
+          // — 若为当前激活会话：先重载历史（含对方刚提的问题）再流转，
+          //   否则 B 只会看到助手输出、看不到用户提问（提问仅存于后端历史）
+          // — 若为后台会话：仅内存累积并标 unread，切回时显示
+          if(!it.done){
+            if(it.session_id === chatState.currentId && !run._flowStarting){
+              run._flowStarting = true;
+              chatRenderMessages().then(function(){
+                run._flowStarting = false;
+                chatResumeLive(it.session_id);
+              }).catch(function(){ run._flowStarting = false; chatResumeLive(it.session_id); });
+            } else {
+              chatResumeLive(it.session_id);
+            }
+          }
+        });
+        if(changed) chatRenderSessions();
+      })
+      .catch(function(){});
+  }
+
+  function chatStartHeartbeat(){
+    if(chatState.heartbeatTimer) return;
+    chatState.heartbeatTimer = setInterval(chatActiveHeartbeat, 5000);
+    // 标签页从后台切回时立即补一次，不等下个周期
+    document.addEventListener('visibilitychange', function(){
+      if(!document.hidden) chatActiveHeartbeat();
+    });
   }
 
   // ═══════════════════════════════════════════════
@@ -3959,8 +4352,9 @@
           : '<div class="prov-key" style="color:var(--red)"><span class="key-dot" style="color:var(--red)">●</span>未配置 Key</div>');
       var actions = '';
       if(isActive) {
-        // 主模型卡片不提供“设为回退”（主模型不能同时是回退模型）
+        // 主模型卡片不提供"设为回退"（主模型不能同时是回退模型）
         actions = '<button class="btn btn-sm" style="color:var(--accent);cursor:default" disabled>使用中</button>' +
+          '<button class="btn btn-sm" id="provTestBtn-'+origIdx+'" onclick="settingsTestProvider('+origIdx+')">测试连接</button>' +
           '<button class="btn btn-sm" onclick="settingsEditProvider('+origIdx+')">编辑</button>';
       } else {
         actions = '<button class="btn btn-sm" onclick="settingsActivate('+origIdx+')">设为默认</button>' +
@@ -4846,6 +5240,82 @@
     });
   };
 
+  // ════════════════════════════════════════
+  // 模型卡片测试连接（卡片内反馈）
+  // ════════════════════════════════════════
+  window.settingsTestProvider = function(idx){
+    if(idx === undefined || idx === null){
+      channelToast('无效索引');
+      return;
+    }
+    var providers = settingsState.config.providers || [];
+    var provider = providers[idx];
+    if(!provider){
+      channelToast('无法获取配置信息');
+      return;
+    }
+    var btn = document.getElementById('provTestBtn-'+idx);
+    if(!btn){
+      channelToast('未找到测试按钮');
+      return;
+    }
+    // 防重复点击；按钮自身展示状态：测试中 → 结果（若干秒后还原为“测试连接”）
+    if(btn.dataset.testing === '1') return;
+    if(!btn.dataset.origLabel) btn.dataset.origLabel = btn.textContent;
+    var restore = function(){
+      btn.dataset.testing = '';
+      btn.disabled = false;
+      btn.style.color = '';
+      btn.textContent = btn.dataset.origLabel || '测试连接';
+    };
+    btn.dataset.testing = '1';
+    btn.disabled = true;
+    btn.style.color = '';
+    btn.innerHTML = '<span class="sess-spin" style="display:inline-block;vertical-align:middle"></span> 测试中';
+
+    var testData = {
+      type: provider.type || 'openai-compatible',
+      model: provider.model || 'auto',
+      temperature: Number(provider.temperature || 0.7),
+      max_tokens: Number(provider.max_tokens || 4096),
+      id: provider.id,
+      base_url: (provider.base_url || '').trim().replace(/\/$/, ''),
+      api_key: provider.api_key || '****keep****'
+    };
+
+    if(!testData.base_url){
+      btn.style.color = 'var(--red)';
+      btn.textContent = '✗ 缺少地址';
+      setTimeout(restore, 3000);
+      return;
+    }
+
+    var headers = { 'Content-Type': 'application/json' };
+    if(monitorToken) headers['X-Monitor-Token'] = monitorToken;
+
+    fetch(apiUrl('/api/config/test'), {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({ provider: testData })
+    }).then(function(r){ return r.json(); }).then(function(out){
+      if(out.error){
+        btn.style.color = 'var(--red)';
+        btn.title = out.error;
+        btn.textContent = '✗ 连接失败';
+      } else {
+        btn.style.color = 'var(--green)';
+        btn.title = '服务正常 (' + out.latency + 'ms) · ' + out.models.length + ' 个可用模型';
+        btn.textContent = '✓ 服务正常';
+      }
+      setTimeout(restore, 4000);
+    }).catch(function(e){
+      btn.style.color = 'var(--red)';
+      btn.title = e.message || '';
+      btn.textContent = '✗ 连接失败';
+      setTimeout(restore, 4000);
+    });
+  };
+
   // 弹窗只通过关闭按钮或操作按钮关闭
 
   // ═══════════════════════════════════════════════
@@ -4904,8 +5374,14 @@
     var doBtn = document.getElementById('doUpdateBtn');
     var alreadyLatest = false; // 已是最新时临时禁用检查按钮，防止重复点击
     if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
-    if (latEl) { latEl.textContent = '检查中…'; latEl.style.color = 'var(--text3)'; }
+    if (latEl) {
+      latEl.innerHTML = '<span class="sess-spin" style="display:inline-block;vertical-align:middle"></span> <span style="font-size:11px;color:var(--text3)">检查中</span>';
+      latEl.style.color = 'var(--text3)';
+    }
     if (doBtn) doBtn.style.display = 'none';
+
+    // 检查 Hermes 引擎版本的同时，强制刷新本应用 GitHub 在线版本（绕过后端 1 小时缓存）
+    if (window.initVersionChip) { try { window.initVersionChip(true); } catch (e) {} }
 
     apiGet('/api/hermes/update/check').then(function(data) {
       if (data.error) throw new Error(data.error);
@@ -5018,18 +5494,24 @@
         if (statusText) statusText.textContent = '更新中…';
       } else if (data.status === 'done') {
         if (updatePollTimer) { clearInterval(updatePollTimer); updatePollTimer = null; }
-        if (statusText) { statusText.textContent = '更新完成！正在重启 Gateway…'; statusText.style.color = 'var(--accent)'; }
+        if (statusText) { statusText.textContent = '更新完成！正在重启服务…'; statusText.style.color = 'var(--accent)'; }
         if (curEl && data.version) curEl.textContent = data.version;
-        // 重启 gateway
+        // 重启 gateway + dashboard
         apiPost('/api/restart').then(function() {
+          // 提示用户刷新页面（避免依赖 restart API 成功率）
+          if (statusText) {
+            statusText.textContent = '更新成功！服务正在重启，请稍候刷新浏览器...';
+            statusText.style.color = 'var(--green)';
+          }
+          // 10 秒后自动跳转回首页（如果还在的话）
           setTimeout(function() {
-            if (statusText) statusText.textContent = '更新完成，Gateway 已重启';
-            if (chkBtn) chkBtn.disabled = false;
-            var latEl = document.getElementById('updateLatestVer');
-            if (latEl) { latEl.textContent = '已是最新'; latEl.style.color = 'var(--green)'; }
-          }, 3000);
+            window.location.href = '/';
+          }, 8000);
         }).catch(function() {
-          if (statusText) { statusText.textContent = '更新完成，但重启失败，请手动重启'; statusText.style.color = 'var(--red)'; }
+          if (statusText) { 
+            statusText.textContent = '更新完成，但重启失败，请手动重启服务'; 
+            statusText.style.color = 'var(--red)'; 
+          }
           if (chkBtn) chkBtn.disabled = false;
         });
       } else if (data.status === 'error') {
@@ -5044,8 +5526,8 @@
     });
   }
 
+  
 
-  // ════════════════════════════════════════════
   //  通讯平台（频道 bot 配置）
   // ════════════════════════════════════════════
   var _chData = null; // { id: { id, name, icon, configured, hidden, fields, toggles, behavior, config } }
@@ -5493,38 +5975,80 @@
   // GET /api/update/check：{ ok, local, latest|null, has_update, checked_at, error? }
   // 三态展示：成功时「当前版本」「在线版本」两格并列；有更新时在线格转橙、显示提示并可点击跳 releases；
   // 在线获取失败（latest 缺失 / error / 网络错误）静默降级：在线格维持「未获取」，不显示错误
-  function initVersionChip(){
+  var lastOnlineVersion = null; // 上次成功获取的在线版本信息，用于获取失败时降级展示，避免留空
+  function initVersionChip(force){
     var curEl = document.getElementById('appCurrentVer');
     var latEl = document.getElementById('appLatestVer');
     var cell = document.getElementById('appLatestCell');
-    var flag = document.getElementById('appUpdateFlag');
     if (!curEl || !latEl || !cell) return;
     var headers = {};
     if (monitorToken) headers['X-Monitor-Token'] = monitorToken;
-    fetch(apiUrl('/api/update/check'), { headers: headers, cache: 'no-store' })
+    // 点击「检查更新」(force) 时先展示旋转动画，表示正在获取在线版本
+    if (force) {
+      latEl.innerHTML = '<span class="sess-spin" style="display:inline-block;vertical-align:middle"></span> <span style="font-size:11px;color:var(--text3)">检查中</span>';
+      latEl.style.color = 'var(--text3)';
+      cell.style.cursor = '';
+      cell.title = '';
+      cell.onclick = null;
+    }
+    // 渲染在线版本格（成功与降级复用）；stale=true 表示本次获取失败、展示的是上次结果
+    function applyOnline(info, stale, force){
+      cell.style.cursor = '';
+      cell.onclick = null;
+      // 默认加载 (force=false)：只显示版本号；强制检查 (force=true) 且无更新时才显示"已是最新"
+      if (info.has_update) {
+        latEl.style.color = 'var(--orange)';
+        latEl.innerHTML = 'v' + escapeHtml(info.latest) + ' <span style="font-size:11px">可更新</span>';
+        cell.style.cursor = 'pointer';
+        cell.title = '发现新版本，点击前往 GitHub 发布页';
+        cell.onclick = function(){ window.open('https://github.com/iranee/fnos-hermes-agent/releases', '_blank', 'noopener'); };
+      } else {
+        if (force) {
+          // 强制检查后：只显示 "已是最新"，绿色，去掉版本号（与 Hermes 版本卡片一致）
+          latEl.textContent = '已是最新';
+          latEl.style.color = 'var(--green)';
+        } else {
+          // 默认加载：只显示版本号，不显示 "已是最新"
+          latEl.innerHTML = 'v' + escapeHtml(info.latest);
+          latEl.style.color = 'var(--text)';
+        }
+        cell.title = '';
+      }
+      if (stale) cell.title = '本次在线获取失败，显示上次结果';
+    }
+    // 获取失败降级：优先展示上次成功结果，无历史时才提示获取失败，绝不留空
+    function onOnlineFail(){
+      if (lastOnlineVersion) applyOnline(lastOnlineVersion, true, force || false);
+      else if (force) { latEl.textContent = '获取失败'; latEl.style.color = 'var(--text3)'; }
+    }
+    // force 态保证旋转动画至少展示 500ms，避免请求过快时一闪而过
+    var startTs = Date.now();
+    var settle = function(fn){
+      var wait = force ? Math.max(0, 500 - (Date.now() - startTs)) : 0;
+      if (wait > 0) setTimeout(fn, wait); else fn();
+    };
+    fetch(apiUrl('/api/update/check' + (force ? '?force=1' : '')), { headers: headers, cache: 'no-store' })
       .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function(d){
-        if (!d || !d.local) return;
-        curEl.textContent = 'v' + d.local;
-        // 降级态：无在线版本可展示，仅填入本地版本
-        if (!d.latest || d.error) return;
-        latEl.textContent = 'v' + d.latest;
-        latEl.style.color = 'var(--text)';
-        if (d.has_update) {
-          latEl.style.color = 'var(--orange)';
-          latEl.innerHTML = 'v' + escapeHtml(d.latest) + ' <span style="font-size:11px">可更新</span>';
-          if (flag) flag.style.display = '';
-          cell.style.cursor = 'pointer';
-          cell.title = '发现新版本，点击前往 GitHub 发布页';
-          cell.onclick = function(){ window.open('https://github.com/iranee/fnos-hermes-agent/releases', '_blank', 'noopener'); };
-        }
+        settle(function(){
+          if (!d || !d.local) { onOnlineFail(); return; }
+          curEl.textContent = 'v' + d.local;
+          // 在线获取失败（latest 缺失 / error）：降级展示上次结果，避免留空
+          if (!d.latest || d.error) { onOnlineFail(); return; }
+          lastOnlineVersion = { latest: d.latest, has_update: !!d.has_update };
+          applyOnline(lastOnlineVersion, false, force || false);
+        });
       })
-      .catch(function(){});
+      .catch(function(){ settle(onOnlineFail); });
   }
+  // 暴露到全局，供「检查更新」按钮触发强制刷新在线版本
+  window.initVersionChip = initVersionChip;
 
   fetchToken().then(function(){
     // P0：首视图（概览）核心状态数据，令牌就绪后立即拉取，返回即填充
     refresh();
+    // 诊断模式检测（并行于 P1 空闲预取）
+    if(!diagnoseMode) checkDiagnoseMode();
     // P1：非首屏模块空闲预取，三者互不依赖、并行发起；延后到浏览器空闲再发，
     // 避免与 P0 状态请求争抢后端响应；各自失败静默，进入对应视图时会重新拉取
     var prefetchSecondary = function(){
