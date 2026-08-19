@@ -256,7 +256,7 @@ ensure_node() {
 }
 
 # ---------------------------------------------------------------------------
-# 从 wheel 中提取 hermes_cli/tui_dist/entry.js（对话 TUI 增强，非致命）
+# 部署与 Hermes 版本匹配的预构建 TUI；旧包无内置产物时回退到 wheel 提取。
 # ---------------------------------------------------------------------------
 ensure_tui_bundle() {
     # 动态定位 hermes_cli 目录（不硬编码 python 版本）
@@ -270,6 +270,16 @@ ensure_tui_bundle() {
     local SP
     SP=$(dirname "${HERMES_CLI_DIR}")
     local ENTRY="${HERMES_CLI_DIR}/tui_dist/entry.js"
+    local DATA_ENTRY="${DATA_DIR}/tui/dist/entry.js"
+    local BUNDLED_ENTRY="${APP_DIR}/config/bootstrap/tui/entry.js"
+
+    if [ -f "${BUNDLED_ENTRY}" ]; then
+        mkdir -p "$(dirname "${ENTRY}")" "$(dirname "${DATA_ENTRY}")"
+        cp "${BUNDLED_ENTRY}" "${ENTRY}"
+        cp "${BUNDLED_ENTRY}" "${DATA_ENTRY}"
+        log_msg "bundled TUI deployed: ${DATA_ENTRY}"
+        return 0
+    fi
 
     # 幂等：已存在则跳过
     if [ -f "${ENTRY}" ]; then
@@ -417,9 +427,23 @@ if [ "${SKIP_INSTALL}" = "false" ]; then
     fi
 
     log_msg ">>> 正在安装 hermes-agent[all]==${HERMES_VERSION}，依赖较多请耐心等待 ..."
+    HERMES_WHEEL="${APP_DIR}/config/bootstrap/wheels/hermes_agent-${HERMES_VERSION#v}-py3-none-any.whl"
+    HERMES_SPEC="hermes-agent[all]==${HERMES_VERSION}"
+    if [ -f "${HERMES_WHEEL}" ]; then
+        HERMES_SPEC="${HERMES_WHEEL}[all]"
+        log_msg "using bundled hermes-agent wheel: ${HERMES_WHEEL}"
+    else
+        log_msg "bundled wheel not found, falling back to package index"
+    fi
+
     UV_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/" \
-        "$UV" pip install --no-cache --python "${VENV_DIR}/bin/python3" "hermes-agent[all]==${HERMES_VERSION}" \
-        2>>"${LOG_FILE}"
+        "$UV" pip install --no-cache --python "${VENV_DIR}/bin/python3" "${HERMES_SPEC}" \
+        2>>"${LOG_FILE}" || {
+            install_rc=$?
+            log_msg "hermes-agent install failed (exit=${install_rc})"
+            tail -20 "${LOG_FILE}" 2>/dev/null || true
+            exit "${install_rc}"
+        }
 
     if [ ! -f "${HERMES}" ]; then
         toast_err "hermes-agent 安装失败: $(tail -5 "${LOG_FILE}" 2>/dev/null)"

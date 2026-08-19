@@ -331,7 +331,17 @@ async function proxyDashboard(req) {
   var P="${prefix}";
   function rw(u){
     if(typeof u!=="string")return u;
-    if(u.indexOf("//")===0||/^[a-z]+:/i.test(u))return u;
+    if(u.indexOf("//")===0)return u;
+    if(/^[a-z]+:/i.test(u)){
+      try{
+        var a=new URL(u,location.origin);
+        if(a.origin===location.origin&&a.pathname.charAt(0)==="/"&&a.pathname.indexOf(P)!==0){
+          a.pathname=P+a.pathname;
+          return a.href;
+        }
+      }catch(e){}
+      return u;
+    }
     if(u.charAt(0)==="/"){if(u.indexOf(P)===0)return u;return P+u;}
     return u;
   }
@@ -409,11 +419,11 @@ async function proxyDashboard(req) {
   /* ── hook HTMLScriptElement.src setter：createElement("script") 后 v.src=...
      走的不是 fetch/XHR，需要在这里加前缀 ── */
   var _sp=HTMLScriptElement.prototype,_sd=Object.getOwnPropertyDescriptor(_sp,"src");
-  if(_sd&&_sd.set){var _ss=_sd.set,_sg=_sd.get;Object.defineProperty(_sp,"src",{get:function(){return _sg?_sg.call(this):undefined;},set:function(v){if(typeof v==="string"&&v.charAt(0)==="/"&&v.indexOf(P)!==0)v=P+v;_ss.call(this,v);},configurable:true,enumerable:_sd.enumerable});}
+  if(_sd&&_sd.set){var _ss=_sd.set,_sg=_sd.get;Object.defineProperty(_sp,"src",{get:function(){return _sg?_sg.call(this):undefined;},set:function(v){_ss.call(this,rw(v));},configurable:true,enumerable:_sd.enumerable});}
   /* ── hook HTMLLinkElement.href setter：createElement("link") 后 x.href=...
      走的不是 fetch/XHR，需要在这里加前缀 ── */
   var _lp=HTMLLinkElement.prototype,_ld=Object.getOwnPropertyDescriptor(_lp,"href");
-  if(_ld&&_ld.set){var _ls=_ld.set,_lg=_ld.get;Object.defineProperty(_lp,"href",{get:function(){return _lg?_lg.call(this):undefined;},set:function(v){if(typeof v==="string"&&v.charAt(0)==="/"&&v.indexOf(P)!==0)v=P+v;_ls.call(this,v);},configurable:true,enumerable:_ld.enumerable});}
+  if(_ld&&_ld.set){var _ls=_ld.set,_lg=_ld.get;Object.defineProperty(_lp,"href",{get:function(){return _lg?_lg.call(this):undefined;},set:function(v){_ls.call(this,rw(v));},configurable:true,enumerable:_ld.enumerable});}
   /* ── hook WebSocket：给 dashboard WS URL 加前缀，路由到 monitor 反代 ── */
   var _WS=window.WebSocket;
   /* iOS 第三方输入法(如百度)在 xterm 终端无法输入的补偿所需：
@@ -480,16 +490,20 @@ async function proxyDashboard(req) {
       }catch(e){}
     },80);
   }
-  document.addEventListener("compositionend",function(ev){
-    try{if(ev&&ev.data&&_isTermTarget(ev.target))_ptyReconcileSend(String(ev.data),Date.now());}catch(e){}
-  },true);
-  document.addEventListener("input",function(ev){
-    try{
-      if(!ev||ev.isComposing||!ev.data||!_isTermTarget(ev.target))return;
-      if(ev.inputType&&ev.inputType!=="insertText"&&ev.inputType!=="insertCompositionText")return;
-      _ptyReconcileSend(String(ev.data),Date.now());
-    }catch(e){}
-  },true);
+  var _isIosTouch=/iP(hone|ad|od)/.test(navigator.userAgent)||
+    (navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+  if(_isIosTouch){
+    document.addEventListener("compositionend",function(ev){
+      try{if(ev&&ev.data&&_isTermTarget(ev.target))_ptyReconcileSend(String(ev.data),Date.now());}catch(e){}
+    },true);
+    document.addEventListener("input",function(ev){
+      try{
+        if(!ev||ev.isComposing||!ev.data||!_isTermTarget(ev.target))return;
+        if(ev.inputType&&ev.inputType!=="insertText"&&ev.inputType!=="insertCompositionText")return;
+        _ptyReconcileSend(String(ev.data),Date.now());
+      }catch(e){}
+    },true);
+  }
 })();
 <\/script>`;
 

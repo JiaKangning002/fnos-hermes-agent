@@ -57,6 +57,8 @@ export_node_path() {
 
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"; }
+
 DATA_DIR=$(resolve_data_dir)
 
 if [ -z "${DATA_DIR}" ]; then
@@ -69,10 +71,8 @@ log_msg "[环境] TRIM_PKGHOME=${TRIM_PKGHOME}"
 log_msg "[环境] DATA_DIR=${DATA_DIR}"
 export PATH="${DATA_DIR}/node/bin:/usr/local/bin:$PATH"
 VAR_DIR="${TRIM_PKGVAR}"
-MONITOR_SCRIPT="${TRIM_APPDEST}/server/monitor.js"
+MONITOR_SCRIPT="${TRIM_APPDEST}/server/boot.js"
 SOCKET_PATH="${TRIM_APPDEST}/hermes-agent.sock"
-
-log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}; }
 
 # ─── 端口检测函数 ──────────────────────────────────────────────────────
 check_and_set_ports() {
@@ -176,7 +176,7 @@ stop_process() {
     fi
     # 兜底：监控器卡死或 PID 文件丢失时，按路径模式清理残留子进程
     # 先杀 main 进程本身
-    pkill -SIGKILL -f "hermes-agent.*(cmd/main|monitor\.js)" 2>/dev/null || true
+    pkill -SIGKILL -f "hermes-agent.*(cmd/main|boot\.js|monitor\.js)" 2>/dev/null || true
     # 再杀 gateway|dashboard
     pkill -SIGKILL -f "hermes-agent.*(gateway|dashboard)" 2>/dev/null || true
     # 最后杀该目录下所有 python/node 子进程

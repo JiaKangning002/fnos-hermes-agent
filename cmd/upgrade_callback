@@ -178,8 +178,17 @@ if [ ! -d "${VENV_DIR}/bin" ] || [ ! -x "${VENV_DIR}/bin/python3" ]; then
 fi
 
 log_msg ">>> 正在安装 hermes-agent[all]==${HERMES_VERSION}，依赖较多请耐心等待 ..."
+HERMES_WHEEL="${APP_DIR}/config/bootstrap/wheels/hermes_agent-${HERMES_VERSION#v}-py3-none-any.whl"
+HERMES_SPEC="hermes-agent[all]==${HERMES_VERSION}"
+if [ -f "${HERMES_WHEEL}" ]; then
+    HERMES_SPEC="${HERMES_WHEEL}[all]"
+    log_msg "using bundled hermes-agent wheel: ${HERMES_WHEEL}"
+else
+    log_msg "bundled wheel not found, falling back to package index"
+fi
+
 UV_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/" \
-    "$UV" pip install --no-cache --python "${VENV_DIR}/bin/python3" "hermes-agent[all]==${HERMES_VERSION}" \
+    "$UV" pip install --no-cache --python "${VENV_DIR}/bin/python3" "${HERMES_SPEC}" \
     2>>"${LOG_FILE}" || true
 
 # 覆盖安装可能失败 → 清 hermes 相关的 site-packages 再试
@@ -187,7 +196,7 @@ if [ ! -f "${HERMES}" ]; then
     log_msg ">>> 首次安装失败，清理后重试 ..."
     rm -rf "${VENV_DIR}"/lib/python*/site-packages/hermes* 2>/dev/null || true
     UV_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/" \
-        "$UV" pip install --no-cache --python "${VENV_DIR}/bin/python3" "hermes-agent[all]==${HERMES_VERSION}" \
+        "$UV" pip install --no-cache --python "${VENV_DIR}/bin/python3" "${HERMES_SPEC}" \
         2>>"${LOG_FILE}" || true
 
     if [ ! -f "${HERMES}" ]; then
@@ -200,6 +209,21 @@ log_msg "hermes binary verified"
 
 ACTUAL_VER=$("$UV" pip show --python "${VENV_DIR}/bin/python3" hermes-agent 2>/dev/null | grep -i '^version' | awk '{print $2}' || echo "unknown")
 log_msg "hermes upgraded: ${ACTUAL_VER}"
+
+# 部署与当前 Hermes tag 同版本的预构建 TUI，供 Dashboard 历史会话恢复使用。
+BUNDLED_TUI="${APP_DIR}/config/bootstrap/tui/entry.js"
+if [ -f "${BUNDLED_TUI}" ]; then
+    DATA_TUI="${DATA_DIR}/tui/dist/entry.js"
+    mkdir -p "$(dirname "${DATA_TUI}")"
+    cp "${BUNDLED_TUI}" "${DATA_TUI}"
+
+    HERMES_CLI_DIR=$("${VENV_DIR}/bin/python3" -c "import hermes_cli,os;print(os.path.dirname(hermes_cli.__file__))" 2>/dev/null || true)
+    if [ -n "${HERMES_CLI_DIR}" ] && [ -d "${HERMES_CLI_DIR}" ]; then
+        mkdir -p "${HERMES_CLI_DIR}/tui_dist"
+        cp "${BUNDLED_TUI}" "${HERMES_CLI_DIR}/tui_dist/entry.js"
+    fi
+    log_msg "bundled TUI deployed: ${DATA_TUI}"
+fi
 
 # 清除版本缓存，让 monitor.js 下次启动时重新检测真实版本
 rm -f "${VAR_DIR}/hermes_version.txt" 2>/dev/null || true
