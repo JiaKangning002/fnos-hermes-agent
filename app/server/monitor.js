@@ -172,7 +172,7 @@ const GATEWAY_API   = `http://localhost:${GATEWAY_PORT}/v1`;
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 // ─── Dashboard 模块接入：注入解析后的端口/路径与共用基础设施 ─────────────
-// log/readPid/stopPid/spawnHermes/findGatewayPid/isPortListening/portAlive
+// log/readPid/stopPid/spawnHermes/restartGateway
 // 均为本文件的函数声明（作用域提升可见），此处仅传引用，实际调用发生在请求期
 initDashboard({
   port: DASHBOARD_PORT,
@@ -183,9 +183,7 @@ initDashboard({
   readPid,
   stopPid,
   spawnHermes,
-  findGatewayPid,
-  isPortListening,
-  portAlive,
+  restartGateway: restartGatewayForDashboard,
 });
 
 // ─── API Key 自动生成（12位随机字母数字）─────────────────────────────────────
@@ -241,7 +239,7 @@ try {
 for (const pidFile of [PID_GATEWAY, PID_DASHBOARD]) {
   const oldPid = readPidSync(pidFile);
   if (oldPid && pidAliveSync(oldPid)) {
-    try { process.kill(oldPid, "TERM"); } catch {}
+    try { process.kill(oldPid, "SIGTERM"); } catch {}
   }
   try { unlinkSync(pidFile); } catch {}
 }
@@ -1902,10 +1900,10 @@ async function waitForExit(pid, timeoutMs = 5000) {
 async function stopPid(pidPath) {
   const pid = readPid(pidPath);
   if (pid) {
-    try { process.kill(pid, "TERM"); } catch {}
+    try { process.kill(pid, "SIGTERM"); } catch {}
     await waitForExit(pid, 5000);
     if (pidAlive(pid)) {
-      try { process.kill(pid, "KILL"); } catch {}
+      try { process.kill(pid, "SIGKILL"); } catch {}
       await new Promise(r => setTimeout(r, 200));
     }
   }
@@ -1921,10 +1919,10 @@ async function stopAgentBridge() {
   for (let i = 0; i < 8; i++) {
     const pid = findPidByCmd("hermes_bridge.py");
     if (!pid || pid === process.pid) break;
-    try { process.kill(pid, "TERM"); } catch {}
+    try { process.kill(pid, "SIGTERM"); } catch {}
     await waitForExit(pid, 3000);
     if (pidAlive(pid)) {
-      try { process.kill(pid, "KILL"); } catch {}
+      try { process.kill(pid, "SIGKILL"); } catch {}
       await new Promise(r => setTimeout(r, 100));
     }
   }
@@ -2044,6 +2042,61 @@ function spawnHermes(name, pidPath, args) {
   }, 1500);
 
   return { ok: true, pid: p.pid };
+}
+
+let dashboardGatewayRestartPromise = null;
+
+function restartGatewayForDashboard() {
+  if (dashboardGatewayRestartPromise) return dashboardGatewayRestartPromise;
+
+  dashboardGatewayRestartPromise = (async () => {
+    const oldPid = readPid(PID_GATEWAY) || findGatewayPid() || null;
+    manualStopEpoch = Date.now();
+    try {
+      await stopPid(PID_GATEWAY);
+
+      // 清理由上游 `hermes gateway restart` 遗留、但未记录在 PID 文件中的进程。
+      for (let i = 0; i < 3; i++) {
+        const residual = findGatewayPid();
+        if (!residual || residual === process.pid) break;
+        try { process.kill(residual, "SIGTERM"); } catch {}
+        await waitForExit(residual, 2000);
+        if (pidAlive(residual)) {
+          try { process.kill(residual, "SIGKILL"); } catch {}
+          await new Promise(r => setTimeout(r, 100));
+        }
+      }
+
+      if (oldPid && pidAlive(oldPid)) {
+        throw new Error(`old gateway process ${oldPid} did not exit`);
+      }
+
+      resetGatewayCrashLoop();
+      await new Promise(r => setTimeout(r, 500));
+      const started = spawnHermes("gateway", PID_GATEWAY, ["gateway", "run"]);
+      if (!started?.ok) throw new Error(started?.error || "spawn failed");
+
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        const pid = readPid(PID_GATEWAY) || findGatewayPid();
+        if (pid && pid !== oldPid && pidAlive(pid)) {
+          await new Promise(r => setTimeout(r, 1000));
+          const stablePid = readPid(PID_GATEWAY) || findGatewayPid();
+          if (stablePid && stablePid !== oldPid && pidAlive(stablePid)) {
+            return { ok: true, pid: stablePid, old_pid: oldPid };
+          }
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      throw new Error("new gateway process did not become ready");
+    } finally {
+      manualStopEpoch = 0;
+    }
+  })().finally(() => {
+    dashboardGatewayRestartPromise = null;
+  });
+
+  return dashboardGatewayRestartPromise;
 }
 
 

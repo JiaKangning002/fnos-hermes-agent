@@ -4,7 +4,7 @@
 //
 // 使用方式（monitor.js）：
 //   initDashboard({ port, gatewayPort, basePath, pidFile, log, readPid,
-//                   stopPid, spawnHermes, findGatewayPid, isPortListening, portAlive })
+//                   stopPid, spawnHermes, restartGateway })
 // 共用基础设施（端口探测 / 进程管理 / 日志 / PID 读写）保留在 monitor.js，
 // 由上面的依赖注入传入，本模块不复制实现；Dashboard 相关问题只需修改本文件。
 import { spawn, WebSocketClient } from "./node-adapter.js";
@@ -24,9 +24,7 @@ let D = {
   readPid: () => null,
   stopPid: async () => {},
   spawnHermes: () => ({ ok: false }),
-  findGatewayPid: () => null,
-  isPortListening: () => false,
-  portAlive: async () => false,
+  restartGateway: async () => ({ ok: false, error: "not_configured" }),
 };
 
 export function initDashboard(deps) {
@@ -72,15 +70,7 @@ export async function checkDashboardHealth() {
 }
 
 // ─── HTTP 反代 ──────────────────────────────────────────────────────
-// 网关重启完成判定：无 systemd 环境下 `hermes gateway restart` 进程会转为常驻网关永不退出，
-// 官方 get_action_status 仅凭该进程是否退出判定完成，导致前端「重启中」永不结束。
-// 记录最近一次重启请求时刻，配合端口健康检查在代理层收尾该状态。
-const RESTART_SETTLE_MS = 6000;
-let lastGatewayRestartTs = 0;
-// 按 pid 记录首次观测到 gateway-restart 进程处于 running 的时刻。
-// 不依赖重启请求是否经代理、也不依赖日志时间戳解析，避免 monitor 重启、
-// 或日志被常驻网关写满截断时 settle 永不触发导致「重启中」卡死。
-let restartFirstSeen = { pid: 0, ts: 0 };
+let managedRestartAction = null;
 
 // /proxy/dashboard 路由入口：前缀剥离守卫 + 未运行 503 + 反代
 export function handleDashboardHttp(req, path) {
@@ -107,12 +97,58 @@ async function proxyDashboard(req) {
 
   const prefix = `${D.basePath || ""}/proxy/dashboard`;
 
-  // 记录网关重启请求时刻 + 重启前的网关 pid：既用于后续判定重启是否已实际完成，
-  // 也用于检测官方复用守卫是否发生「未真正重启」的空操作（返回 pid == 重启前 pid）。
-  let restartPreGwPid = 0;
   if (req.method === "POST" && subPath === "/api/gateway/restart") {
-    lastGatewayRestartTs = Date.now();
-    restartPreGwPid = D.findGatewayPid() || 0;
+    if (managedRestartAction?.running) {
+      return new Response(JSON.stringify({
+        ok: true,
+        pid: managedRestartAction.pid,
+        name: "gateway-restart",
+        reused: true,
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+    managedRestartAction = {
+      running: true,
+      exit_code: null,
+      pid: null,
+      lines: [`=== fnOS gateway restart started ${new Date().toISOString()} ===`],
+    };
+    try {
+      const result = await D.restartGateway();
+      if (!result?.ok || !result?.pid) {
+        throw new Error(result?.error || "gateway did not start");
+      }
+      managedRestartAction.pid = result.pid;
+      managedRestartAction.running = false;
+      managedRestartAction.exit_code = 0;
+      managedRestartAction.lines.push(
+        `Gateway restarted by fnOS process manager: ${result.old_pid || "none"} -> ${result.pid}`,
+      );
+      D.log(`[restart] fnOS 网关重启完成 ${result.old_pid || "none"} -> ${result.pid}`);
+      return new Response(JSON.stringify({
+        ok: true,
+        pid: result.pid,
+        name: "gateway-restart",
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    } catch (e) {
+      managedRestartAction.running = false;
+      managedRestartAction.exit_code = 1;
+      managedRestartAction.lines.push(`Gateway restart failed: ${e?.message || e}`);
+      D.log(`[restart] fnOS 网关重启失败：${e?.message || e}`);
+      return new Response(JSON.stringify({
+        ok: false,
+        error: e?.message || String(e),
+      }), { status: 500, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
+  }
+
+  if (req.method === "GET" && subPath === "/api/actions/gateway-restart/status" && managedRestartAction) {
+    return new Response(JSON.stringify({
+      name: "gateway-restart",
+      running: managedRestartAction.running,
+      exit_code: managedRestartAction.exit_code,
+      pid: managedRestartAction.pid,
+      lines: managedRestartAction.lines,
+    }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
   }
 
   try {
@@ -142,91 +178,6 @@ async function proxyDashboard(req) {
     }
 
     const contentType = respHeaders.get("content-type") || "";
-
-    // ── 网关重启 POST：修复官方复用守卫导致的「连续第二次重启空操作」 ──
-    // 无 systemd 下 `hermes gateway restart` 进程(P1)杀旧网关后自身转为常驻网关不退出，
-    // 官方 _spawn_gateway_restart 的复用守卫见 P1 仍存活便直接 return existing(空操作)，
-    // 返回的 pid 即当前在跑的网关本体 → 第二次重启根本没重启、动作日志无新输出，
-    // 前端永久卡在「重启中/等待输出…」。检测到返回 pid == 重启前网关 pid（即未真正重启）时，
-    // 杀掉旧网关并重发一次，迫使官方 spawn 出真正的新 restart 进程。monitor 无自动重生
-    // 循环（网关仅由 /api/start、/api/restart 显式启动），故此处杀进程不会与 monitor 抢占冲突。
-    if (req.method === "POST" && subPath === "/api/gateway/restart") {
-      let bodyText = await upstream.text();
-      try {
-        const j = JSON.parse(bodyText);
-        const rpid = Number(j && j.pid) || 0;
-        if (rpid && restartPreGwPid && rpid === restartPreGwPid && D.isPortListening(D.gatewayPort)) {
-          D.log(`[restart] 官方复用旧网关进程 pid=${rpid}(未真正重启)，杀掉后强制重发重启`);
-          try { process.kill(rpid, "SIGTERM"); } catch {}
-          // 以端口是否仍在 LISTEN 判断旧网关是否已退出（比 pidAlive 更可靠：
-          // 进程成为 zombie 时 kill(pid,0) 仍返回存活，会误判）。
-          const deadline = Date.now() + 3000;
-          while (D.isPortListening(D.gatewayPort) && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, 100));
-          }
-          if (D.isPortListening(D.gatewayPort)) {
-            try { process.kill(rpid, "SIGKILL"); } catch {}
-            await new Promise(r => setTimeout(r, 300));
-          }
-          // 旧进程已退出，官方复用守卫的 poll() 将失效 → 重发触发真正的新 restart
-          restartFirstSeen = { pid: 0, ts: 0 };
-          lastGatewayRestartTs = Date.now();
-          const rh = new Headers(req.headers);
-          rh.delete("host");
-          // 重发不带 body，须清除原始请求的 body 相关头，否则上游等 body 超时
-          rh.delete("content-length");
-          rh.delete("content-type");
-          rh.delete("transfer-encoding");
-          try {
-            const up2 = await fetch(target, { method: "POST", headers: rh, signal: AbortSignal.timeout(10000) });
-            bodyText = await up2.text();
-            D.log(`[restart] 已强制重发重启，官方应 spawn 新 gateway restart 进程`);
-          } catch (e) {
-            D.log(`[restart] 强制重发重启失败：${e?.message || e}`);
-          }
-        }
-      } catch {}
-      respHeaders.delete("content-length");
-      respHeaders.set("cache-control", "no-store");
-      return new Response(bodyText, { status: upstream.status, headers: respHeaders });
-    }
-
-    // ── 网关重启 action 状态改写 ──
-    // `hermes gateway restart` 进程转为常驻网关不退出 → 官方永远回报 running:true。
-    // 重启实际已完成（距请求已过 settle 且网关端口健康）时改写为 running:false 收尾「重启中」。
-    if (req.method === "GET" && subPath === "/api/actions/gateway-restart/status") {
-      let bodyText = await upstream.text();
-      try {
-        const j = JSON.parse(bodyText);
-        if (j && j.running === true) {
-          const now = Date.now();
-          const pid = Number(j.pid) || 0;
-          // pid 变化视为新的重启进程，重新计时；常驻进程复用时沿用首次观测时刻
-          if (restartFirstSeen.pid !== pid) {
-            restartFirstSeen = { pid, ts: now };
-          }
-          // 以「用户最近一次点击重启」或「首次观测到 running」中较晚者为起点计 settle
-          const startedMs = Math.max(restartFirstSeen.ts, lastGatewayRestartTs || 0);
-          const settled = (now - startedMs) > RESTART_SETTLE_MS;
-          // 8642 为非 HTTP 内部端口，优先用 /proc 的 LISTEN 判据，HTTP 探活作兜底
-          const listening = D.isPortListening(D.gatewayPort);
-          const alive = settled && (listening || await D.portAlive(D.gatewayPort));
-          if (settled && alive) {
-            j.running = false;
-            if (j.exit_code === null || j.exit_code === undefined) j.exit_code = 0;
-            bodyText = JSON.stringify(j);
-            D.log(`[restart] 网关端口 ${D.gatewayPort} 健康且已 settle(${((now - startedMs) / 1000).toFixed(1)}s)，改写 gateway-restart 状态为完成以收尾「重启中」`);
-          } else {
-            D.log(`[restart] gateway-restart 仍 running：settled=${settled} listening=${listening} pid=${pid}`);
-          }
-        } else {
-          restartFirstSeen = { pid: 0, ts: 0 };
-        }
-      } catch {}
-      respHeaders.delete("content-length");
-      respHeaders.set("cache-control", "no-store");
-      return new Response(bodyText, { status: upstream.status, headers: respHeaders });
-    }
 
     // ── CSS 响应：改写 url(/...) 加前缀，让字体等 url() 引用能正确路由 ──
     if (contentType.includes("text/css") || subPath.endsWith(".css")) {
